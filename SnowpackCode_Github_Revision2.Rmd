@@ -1,0 +1,3594 @@
+---
+title: "Snowpack Code 2026"
+output: html_document
+date: "2026-03-2"
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+knitr::opts_knit$set(root.dir = "/Users/thema/Documents/Github/Canopy-gap-age-snowpack-study-2025")
+
+```
+
+## R Markdown
+
+The main purpose of this code version is to do a sensitivity analysis of the control site gap ages. A gap age of 60 was assigned to the two control sites, but 60 was also chosen somewhat arbitrarily. Given the typical rotation age (50-80 years) for timber harvests for this ecosystem, I will be testing if changing the age of the control sites really changes the outcome that much.
+
+
+This is an R Markdown document. Markdown is a simple formatting syntax for authoring HTML, PDF, and MS Word documents. For more details on using R Markdown see <http://rmarkdown.rstudio.com>.
+
+When you click the **Knit** button a document will be generated that includes both content as well as the output of any embedded R code chunks within the document. You can embed an R code chunk like this:
+
+Load all necessary packages
+
+
+```{r}
+library(tidyverse)
+library(broom)
+library(readxl)
+library(corrplot)
+library(factoextra)
+library(EnvStats)
+library(olsrr)
+library(boot)
+library(MARSS)
+library(caret)
+library(car)
+library(lmtest)
+library(dotwhisker)
+library(dplyr)
+library(ggpubr)
+library(stringr)
+library(ggplot2)
+library(tidyr)
+```
+PART 1: MULTIPLE LINEAR REGRESSION MODELS FOR MARCH SNOW DEPTH AND SNOW DISSAPEARANCE DATE
+(cross-sectional data)
+
+Load the raw excel data and process it to get calculate northness, eastness, and small-tree ratio variables
+```{r}
+setwd("/Users/sabrinachui/Documents/GitHub/Canopy-gap-age-snowpack-study-2025")
+raw_data <- read_excel("raw_data.xlsx")
+
+#convert aspect from degrees to aspect radians
+raw_data$aspect_rad <- raw_data$aspect_deg*pi/180
+
+#convert SDD from date to nth day of 2021
+raw_data$SDD_n <- as.numeric(strftime(raw_data$SDD, format = "%j"))
+
+#calculate aspect-cosine and aspect-sine
+raw_data$aspect_cos <- cos(raw_data$aspect_rad) #needed for northness
+raw_data$aspect_sin <- sin(raw_data$aspect_rad) #needed for eastness
+
+#calculate northness and eastness (takes slope into account and accounts for flat spots)
+raw_data$northness <- sin(raw_data$slope)*raw_data$aspect_cos
+raw_data$eastness <- sin(raw_data$slope)*raw_data$aspect_sin
+
+#calculate small-tree ratio (TPA less than 3" DBH/total TPA)- should be equal to TPH less than 7.6cm/Total TPH, just saves converting TPH_under3 
+raw_data$small_tree_ratio <- raw_data$TPA_under3/raw_data$TPA_Total
+
+#Convert from Imperial to SI units
+raw_data$size <- raw_data$size_ac*0.4046856422 #convert size from acre to hectare
+raw_data$BA <- raw_data$BA_ac*0.22956841138 #convert basal area from (ft^2/ac) to (m^2/hectare)
+raw_data$avg_shrub_ht <- raw_data$avg_shrub_ht_ft*0.3048#convert avg shrub ht from ft to m
+raw_data$TPH <- raw_data$TPA_Total*2.47105 #convert from total trees per acre to total trees per hectare 
+raw_data$neighbor_ht <- raw_data$neighbor_ht_ft*0.3048 #convert neighboring tree height from feet to meters
+
+#Grab subset of data (including transformed data) to use
+processed_data <- raw_data[, c("gap_ID", "march_sd", "SDD_n", "age", "slope", "TPH", "avg_shrub_ht", "per_shrub_cover", "BA", "neighbor_ht", "size", "small_tree_ratio", "northness", "eastness")]
+
+#did not include canopy cover because even though it was measured, these were such young stands it was was hard defining when you technically have a "canopy"
+```
+March snow depth (march_sd) and snow disappearance date (SDD) are the response variables.
+
+Produce summary statistics table for just the 28 gap sites
+```{r}
+# Separate gap sites (rows 1-28)
+gap_sites <- processed_data[1:28, ]
+
+# Calculate summary statistics
+variables <- c("age", "slope", "TPH", "avg_shrub_ht", "per_shrub_cover", 
+               "BA", "neighbor_ht", "size", "small_tree_ratio", "northness", "eastness")
+
+summary_table <- data.frame(
+  Variable = variables,
+  Min  = sapply(variables, function(v) round(min(gap_sites[[v]], na.rm = TRUE), 2)),
+  Mean = sapply(variables, function(v) round(mean(gap_sites[[v]], na.rm = TRUE), 2)),
+  Max  = sapply(variables, function(v) round(max(gap_sites[[v]], na.rm = TRUE), 2))
+)
+
+print(summary_table)
+```
+
+
+Check the assumptions for MLR
+
+1. Relationship between response variable and predictors (including control variables) should be linear
+```{r}
+independent_variables <- c("age", "slope", "TPH", "avg_shrub_ht", "per_shrub_cover", "BA", "neighbor_ht", "size", "small_tree_ratio", "northness", "eastness")
+
+#plot independent variables against March snow depth
+for (var in independent_variables) {
+  plot(processed_data[[var]], processed_data$march_sd, 
+       main = paste(var, "vs march_sd"), 
+       xlab = var, ylab = "march_sd")
+}
+
+#Visually I'm not seeing a lot of linearity, so I'll see if a log transformation of march_sd will help
+processed_data$ln_march_sd <- log(processed_data$march_sd+1)
+
+#plot independent variables against ln March snow depth
+for (var in independent_variables) {
+  plot(processed_data[[var]], processed_data$ln_march_sd, 
+       main = paste(var, "vs ln_march_sd"), 
+       xlab = var, ylab = "ln_march_sd")
+}
+# Visually the plots look a bit better after the log transformation--> going to move forward with ln(march snow depth) instead
+
+#see if SDD as a response variable needs to be transformed
+for (var in independent_variables) {
+  plot(processed_data[[var]], processed_data$SDD_n, 
+       main = paste(var, "vs SDD"), 
+       xlab = var, ylab = "SDD")
+}
+#doesn't look like we need to transform SDD like we do for march snow depth
+```
+2.  The residuals should be independent of each other
+```{r}
+#Since the data is cross-sectional (not time series) and there is no clustered/group data, I assume that this assumption is met. 
+```
+3. There should be no multi-collinearity
+```{r}
+#Create the linear model for ln_marchsd
+model_ln_marchsd<- lm(ln_march_sd~age+slope+size+BA+TPH+avg_shrub_ht+per_shrub_cover+neighbor_ht+northness+eastness+small_tree_ratio, processed_data)
+
+#Create the linear model for SDD
+model_SDD<- lm(SDD_n~age+slope+size+BA+TPH+avg_shrub_ht+per_shrub_cover+neighbor_ht+northness+eastness+small_tree_ratio, processed_data)
+
+#Check VIF
+vifvalues_ln_marchsd <- vif(model_ln_marchsd)
+vifvalues_ln_marchsd #All below 3, though age has the highest VIF value
+
+vifvalues_model_SDD<- vif(model_SDD)
+vifvalues_model_SDD #All except one have a VIF value below 3. per_shrub_cover has a VIF of 4.16
+
+#every variable has a VIF below 5. Age has a VIF of 2.8 (ln_march_sd)and 2.4 (SDD) so it has a moderate level of correlation with other variables, but this level is  considered acceptable. 
+```
+4.  Variance residuals should be homoskedastic
+```{r}
+#Use the same linear models created to check assumption #3
+
+#Use the Breusch-Pagan Test for heteroskedasticity for ln_marchsd model- Null Hypothesis: The residuals are homoskedastic
+bptest(model_ln_marchsd)
+#p-value is > 0.05 so we fail to reject to the null,  we can assume there's no heteroskedasticity
+
+#Use the Breusch-Pagan Test for heteroskedasticity for SDD model- Null Hypothesis: The residuals are homoskedastic
+bptest(model_SDD)
+#p-value is > 0.05 so we fail to reject to the null,  we can assume there's no heteroskedasticity
+```
+5. Residuals should be normally distributed
+```{r}
+# Get the model residuals for model_ln_marchsd
+ln_marchsd_residuals = model_ln_marchsd$residuals
+
+# Plot the residuals and Q-Q line
+qqnorm(ln_marchsd_residuals) #Run both lines together
+qqline(ln_marchsd_residuals, col = "red", lwd = 1) #Run both lines together
+
+# Get the model residuals for model_SDD
+SDD_residuals = model_SDD$residuals
+
+# Plot the residuals and Q-Q line
+qqnorm(SDD_residuals)
+qqline(SDD_residuals, col = "red", lwd = 1)
+
+#Based on the QQ plots, it seems that the residuals for both the ln_marchsd and SDD models are normally distributed, meeting our last assumption for multiple linear regression.
+
+```
+All the assumptions for a multiple linear regression have been met.
+
+There are eleven predictors, including age (the independent variable of interest) and other control variables. 
+
+1A: TEST IF ADDING AGE SIGNIFICANTLY IMPROVES THE FIT OF THE MLR MODEL FOR LN MARCH SNOW DEPTH
+
+Null hypothesis: Including age does not improve the model after adjusting for added complexity.
+Alternative hypothesis: Including age improves the model, even after adjusting for added complexity.
+```{r}
+#create a model WITHOUT age as a predictor, for ln_marchsd as a dependent variable
+mod1 <- lm(ln_march_sd~slope+size+BA+TPH+avg_shrub_ht+per_shrub_cover+neighbor_ht+northness+eastness+small_tree_ratio, data = processed_data)
+
+#Find the subset of predictors that do the best at describing the variation in ln march snow depth
+mod1_subsets <- ols_step_best_subset(mod1)
+mod1_subsets
+
+#Model 4 has  lowest AIC score (71.4435), with slope, BA, TPH, and neighbor_ht as the 4 predictors. Only looking at AIC score right now and not considering Adj. R-square or Predicted R-square since I want to use AIC as a comparison for the nested ANOVA tests later on.
+
+#Create subset model with the four predictors
+ln_marchsd_model4<- lm(ln_march_sd~slope+BA+TPH+neighbor_ht, processed_data)
+summary(ln_marchsd_model4) # p-value: 0.002305
+
+#Add age in as predictor to the current best model
+ln_marchsd_model4_age<-lm(ln_march_sd~age+slope+BA+TPH+neighbor_ht, processed_data)
+summary(ln_marchsd_model4_age) # p-value: 0.0001887
+plot(ln_marchsd_model4_age) #Double check assumptions of MLR visually
+shapiro.test(residuals(ln_marchsd_model4_age)) #check the residuals are normally distributed- don't look perfect but should be acceptable
+
+#Use ANOVA test to see if adding age significantly improves the model
+anova(ln_marchsd_model4,ln_marchsd_model4_age) # p=value=0.006171
+library(AICcmodavg)
+
+#Also calculate AICc scores for the results table
+AICc(ln_marchsd_model4) # 78.66976
+AICc(ln_marchsd_model4_age) #72.54203
+
+# The P-value is less than 0.001, so the result is statistically significant at the 0.1% level.This indicates that adding age significantly improves the model, even after accounting for the complexity of adding another predictor.
+```
+We reject the null hypothesis --> Adding age improves the fit of the (previous "best") MLR model for ln march snow depth, even after considering the added complexity
+
+1B: FINDING THE BEST (MOST PARSIMONIOUS) MLR MODEL FOR LN MARCH SNOW DEPTH
+```{r}
+# Now that we have established that age is an important predictor, we try the ols_step_best_subset function with age included to see if the best subset of predictors change
+mod1full <- lm(ln_march_sd~age+slope+size+BA+TPH+avg_shrub_ht+per_shrub_cover+neighbor_ht+northness+eastness+small_tree_ratio, data = processed_data)
+mod1full_subsets <- ols_step_best_subset(mod1full)
+mod1full_subsets
+#Based on Predicted R-square and AIC, Model 5 appears to be the best model with the predictors: age, slope, TPH, avg_shrub_ht, and per_shrub_cover.     
+
+###### However, ols_step_best_subset doesn't include AICc and we should calculate it because the sample size is so small (n=30)
+
+#Calculate AICc for mod1full (ln_march_sd)
+mod1full_AIC <-c(65.4161,62.3949,59.3377,59.4653,55.5650,56.0124,57.5241,59.2051,60.8236,62.7913,64.7913)
+mod1full_k<-c(1,2,3,4,5,6,7,8,9,10,11)
+n<-30
+# Initialize vector to store AICc values
+mod1full_AICc <- numeric(length(mod1full_AIC))
+
+for (i in 1:length(mod1full_AIC)) {
+  k <- mod1full_k[i]
+  AIC <- mod1full_AIC[i]
+  
+  # Calculate AICc using the formula: AICc = AIC + 2k(k+1)/(n-k-1)
+  correction <- (2 * k * (k + 1)) / (n - k - 1)
+  mod1full_AICc[i] <- AIC + correction
+  
+}
+mod1full_AICc #AICc score is lowest for Model 3 (so different than if we were only looking at the ols_subset outputs only, where Model 5 was suggested as the best)
+
+#Best MLR model for ln March snow depth (according to AICc scores):
+ln_marchsd_best <- lm(ln_march_sd~age+TPH+per_shrub_cover, data = processed_data)
+summary(ln_marchsd_best )
+
+# All the predictors are statistically significant, especially age
+```
+1C: TEST IF ADDING AGE SIGNIFICANTLY IMPROVES THE FIT OF THE MLR MODEL FOR SNOW DISAPPEARANCE DATE
+
+The null hypothesis: Including age does not improve the model after adjusting for added complexity.
+Alternative hypothesis: Including age improves the model, even after adjusting for added complexity.
+```{r}
+#create a model WITHOUT age as a predictor, for SDD as a dependent variable
+mod2 <- lm(SDD_n~slope+size+BA+TPH+avg_shrub_ht+per_shrub_cover+neighbor_ht+northness+eastness+small_tree_ratio, data = processed_data)
+
+#Find the subset of predictors that do the best at describing the variation in SDD
+mod2_subsets <- ols_step_best_subset(mod2)
+mod2_subsets
+
+#Model 2 has the lowest AIC score (149.2724), with size and small_tree_ratio as the two predictors
+
+#Create subset model with the two predictors and calculate Adjusted R-squared
+SDD_model2<- lm(SDD_n~size+small_tree_ratio, processed_data)
+summary(SDD_model2) # p-value: 0.04679 This indicates a statistically significant relationship, but if you look at the independent variables themselves, neither have a p-value less than 0.05
+
+#Add age in as predictor to the current best model
+SDD_model2_age<-lm(SDD_n~age+size+small_tree_ratio, processed_data)
+summary(SDD_model2_age) # p-value: 0.004889, the overall p-value is lower, and age is a statistically significant variable in this model version
+plot(SDD_model2_age) #Double check assumptions of MLR visually
+shapiro.test(residuals(SDD_model2_age)) #check the residuals are normally distributed- they are
+
+#Test to see if adding age significantly improves the model
+anova(SDD_model2,SDD_model2_age)
+
+AICc(SDD_model2)
+AICc(SDD_model2_age)
+
+# The P-value is less than 0.05, so adding age  significantly improves the model. Therefore, age is helpful as an additional predictor for the outcome variable in this context based on the predictors that were already chosen.
+```
+We reject the null hypothesis --> Adding age improves the fit of the MLR model for SDD, even after considering the added complexity.
+
+1D: FINDING THE BEST MLR MODEL FOR SDD
+```{r}
+# The last step in the analysis showed that adding age to the existing best subset of predictors significantly improves the MLR model. Let's try the ols_step_best_subset function with age included to see if adding age as a predictor from the start will change what the best subset of predictors are.
+
+mod2full <- lm(SDD_n~age+slope+size+BA+TPH+avg_shrub_ht+per_shrub_cover+neighbor_ht+northness+eastness+small_tree_ratio, data = processed_data)
+mod2full_subsets <- ols_step_best_subset(mod2full)
+mod2full_subsets
+# Model 3 has the highest predicted R-square and lowest AIC. The predictors are: age, TPH, and avg_shrub_ht.
+
+####################################
+#Calculate AICc for mod2full (SDD)
+mod2full_AIC <-c(141.9757,138.5531,137.9246,138.5819,138.9958,139.2088,140.1174,140.9043,142.7807,144.7447,146.7352)
+mod2full_k<-c(1,2,3,4,5,6,7,8,9,10,11)
+n<-30
+# Initialize vector to store AICc values
+mod2full_AICc <- numeric(length(mod2full_AIC))
+
+for (i in 1:length(mod2full_AIC)) {
+  k <- mod2full_k[i]
+  AIC <- mod2full_AIC[i]
+  
+  # Calculate AICc using the formula: AICc = AIC + 2k(k+1)/(n-k-1)
+  correction <- (2 * k * (k + 1)) / (n - k - 1)
+  mod2full_AICc[i] <- AIC + correction
+  
+}
+mod2full_AICc # Model 3 has the lowest AICc score, but Model 2's AICc score is only 0.1498 greater. Since their AICc scores are so similar, I'll go with the simpler Model 2 with age + TPH
+
+
+# Best MLR model for Snow disappearance date:
+SDD_best <- lm(SDD_n~age+TPH, data = processed_data)
+summary(SDD_best)
+
+# Looking at the summary of SDD_best, we see that the model is statistically significant (p-value: 0.0006855). Age and TPH are statistically significant predictors.
+```
+The MLR analysis was helpful for finding predictors of snow depth and SDD, but these predictors are only helpful for cross-sectional data. I want to see if there are more insights that can be gained from snow depth measurements taken over the season. I have snow depth data for 25 sites, over 73 days. 
+
+
+PART 2: TIME SERIES ANALYSIS SNOW DEPTH
+(time series data)
+
+I'm using MARSS models to analyze my time-series data as it can model multi-variate data. The state-space component was needed to account for variation (in age, TPH, etc.) across different study plots. Each model has the following form:
+
+$ x_{t}=\textbf{B}x_{t-1}+\textbf{u}+\textbf{Cc}_{t-1}+\textbf{w}_{t},$    $\textbf{w}_{t}\sim \text{MVN}(0,\textbf{Q}) $ (Eqn 1), the state process
+$\textbf{y}_{t}=\textbf{Zx}_{t}+\textbf{v}_{t},$.    $\textbf{v}_{t}\sim \text{MVN}(0,\textbf{R}) $ (Eqn 1), the observation process
+
+$ x_{t}$ is the latent (unobserved) true snow depth at time t. Dimensions: 25 x 1 (for a single time step), 25 x 73 (full matrix over all time steps)
+$\textbf{B} $ state transition matrix, but in this case it is an identity matrix since there is no reason to believe that snow depth at one site interacts with/influence snow depth at another site. Dimensions: 25 x 25.
+$\textbf{u}$ is the drift vector and describes the drift for each state-space (site) and is set as “unequal” to allow each state (site) to have its own independent mean drift value. Dimensions: 25 x 1.
+$\textbf{C} $ is the covariate effects matrix that describes how the 4 drivers (covariates) affect snow depth on day t. Dimensions: 25 x 4.
+$ \textbf{c}_{t-1}$ is the covariate values at time t-1. The drivers (covariates) are normalized to account for their different magnitudes. Dimensions: 4 x 1 (for a single time step), 4 x 73 (full matrix over all time steps).
+$\textbf{w}_{t} $ is the process noise at time t,it accounts for unexplained random variation in how the true snow depth changes over time that isn’t explained by the previous time step, over drift, and covariate effects. It follows a normal distribution with a mean vector of 0 and a covariance matrix of Q. Dimensions: 25 x 1.
+
+
+$ y_{t}$ is the observed snow depth on day t, modeled as a linear function of the latent (true) snow depth, $ x_{t}$. Dimensions: 25 x 1 (for a single time step), 25 x 73 (full matrix over all time steps)
+$\textbf{Z} $ is the observation matrix that connects each observation to its latent (true) state. Dimensions: 25 x 25 
+$\textbf{v}_{t} $ is the observation noise at time t, and represents random error in snow depth measurements. It follows a normal distribution with a mean vector of 0 and a covariance matrix of R. Dimensions: 25 x 1.
+
+Load $ y_{t}$ data
+
+```{r} 
+snowdepth_TSA<-read_excel("snowdepth_TSA.xlsx")
+
+#Transpose the database so that dates are now columns, and automatically makes it into a matrix
+snowdepth_t <-t(snowdepth_TSA) 
+snowdepth_t <- snowdepth_t[-1,] # gets rid of first row, the dates
+
+# Transform the character matrix to a numeric matrix
+dat<-matrix(as.numeric(snowdepth_t),ncol=ncol(snowdepth_t)) # transforms from a character matrix to a numeric matrix
+dim(dat)  # This is our observed snow depth matrix y_t
+```
+My variates are snow depth (in cm) over days (73 time steps) for 25 different plots.
+
+Based on  existing literature and what weather data was available from the Blodgett Forest Research Station RAWS , I assume drivers (covariates) of changes in snow depth over time are solar radiation, wind speed, temperature, and precipitation. However, the type of precipitation matters. Snow will lead to an increase in snow depth, whereas rain will lead to a decrease in snow depth. A better driver that captures this nuance could be an interaction variable between precipitation and temperature (precipxtemp). Since temperature is measured in Celsius, precipxtemp will be negative when it's snowing, positive when it's raining, or 0 when there is no precipitation. 
+
+Load $ \textbf{c}_{t-1}$ data
+```{r, eval = FALSE} 
+drivers<- read_excel("drivers.xlsx")
+
+# Drivers (covariates) are 1) average daily temperature, and 2) precipxtemp (interaction between temperature and precip), 3) avg daily solar radiation (kJ/m), and 4) avg daily wind speed
+
+# Normalize the covariates since they have different magnitudes
+temp <- t(drivers$avg_temp10)
+temp_Zscored <- zscore(temp,mean.only = TRUE)
+
+precipxtemp <- t(drivers$precipxtemp)
+precipxtemp_Zscored <- zscore(precipxtemp,mean.only = TRUE)
+
+solrad <- t(drivers$sol_rad)
+solrad_Zscored <- zscore(solrad,mean.only = TRUE)
+
+wind <- t(drivers$avg_wind)
+wind_Zscored <- zscore(wind,mean.only = TRUE)
+
+transformed_covar<-rbind(temp_Zscored, precipxtemp_Zscored,solrad_Zscored,wind_Zscored)
+rownames(transformed_covar)<- c("temp_z", "precipxtemp_z", "solrad_z", "wind_z")
+class(transformed_covar) # Check it's a matrix. 
+```
+
+HYPOTHESIS: A MARSS model in which covariate effects (C matrix)  are grouped based on a statistically significant predictor identified in the multiple linear regression (MLR) analysis (e.g., canopy gap age, slope, TPH, average shrub height, percent shrub cover) will have a lower AICc score than a MARSS model with an unconstrained C matrix, where covariate effects are estimated separately for each of the 25 sites.
+
+NULL HYPOTHESIS: Grouping the covariate effects in the C matrix by predictors does not yield a significantly better-fitting model (i.e., lower AICc) than estimating covariate effects independently for each site.
+
+Note on the Z matrix: I briefly considered whether the Z matrix (which maps the latent state to observed measurements) should be constrained based on statistically significant predictors identified in the MLR analysis. However, snow depth was measured using a standardized and straightforward method across all sites—a height pole photographed by a game camera four times daily. While each site only had one measurement location (i.e., one pole), the method itself was consistent, and there is no reason to believe that canopy gap age or other site characteristics systematically altered the way the latent snowpack state was translated into observed snow depth. In other words, I assume that the observation process was consistent, even if the amount of snow differed across sites due to biophysical variation. The Z matrix is typically constrained in more complex observation scenarios—such as fisheries studies where population estimates are based on partial or probabilistic samples. In this case, because snow depth was directly observed in a uniform way, I do not constrain the Z matrix in the MARSS model.
+
+While the ols subset process used in the MLR analysis suggests some predictors are more statistically significant than others, I want to make sure to test all of the available predictors for the MARSS analysis.
+
+Run the following models:
+mod.X.control:    unconstrained Z matrix, unconstrained C matrix
+mod.X.age:        unconstrained Z matrix, C matrix constrained by canopy gap age
+mod.X.slope:      unconstrained Z matrix, C matrix constrained by slope
+mod.X.TPH:        unconstrained Z matrix, C matrix constrained by TPH
+mod.X.shrubht:    unconstrained Z matrix, C matrix constrained by average shrub height
+mod.X.shrubcov:   unconstrained Z matrix, C matrix constrained by percent shrub cover
+mod.X.BA:         unconstrained Z matrix, C matrix constrained by basal area
+mod.X.neighborht: unconstrained Z matrix, C matrix constrained by neighbor_ht
+mod.X.size:       unconstrained Z matrix, C matrix constrained by canopy gap size
+mod.X.smalltree:  unconstrained Z matrix, C matrix constrained by small_tree_ratio
+mod.X.northness:  unconstrained Z matrix, C matrix constrained by northness
+mod.X.eastness:   unconstrained Z matrix, C matrix constrained by eastness
+
+I'm trying to balance the variation in the data by grouping the variables into more bins witht he fact that I don't have that many sites. So the greater number of bins = more paramaters to estimate when the sample size is only 25. So Even if in reality, bins of 4 or greater might describe the data better, right now I will only look at bins of 2 and 3 for this study.
+
+mod.1.age:        unconstrained Z matrix, C matrix constrained by canopy gap age --> refers to 2 bins
+mod.2.age:        unconstrained Z matrix, C matrix constrained by canopy gap age --> refers to 3 bins
+
+Set up the models- define the C matrices
+Set up the C matrix for the unconstrained control model
+```{r, eval = FALSE} 
+states <- 1:25
+c1 <- paste0("state", states, ".temp")
+c2 <- paste0("state", states, ".PxT")
+c3 <- paste0("state", states, ".solrad")
+c4 <- paste0("state", states, ".wind")
+
+control <-matrix(cbind(c1,c2,c3,c4),nrow=25,ncol=4, byrow=FALSE)
+colnames(control) <- c("temp","PxT","solrad" ,"wind")
+```
+
+Set up C matrices for the constrained models (mod.1.XXX)
+TRYING 2 BINS FIRST (2 bins x 4 drivers = 8 parameters to estimate)
+Step 1: create bins for the variables of interest- find the natural break for two bins per variable
+```{r, eval = FALSE, fig.show='hold', fig.width=12, fig.height=9}
+#Subset the 25 sites being used for the time-series analysis and make a new data frame
+allvariables_TSA  <- subset(processed_data, gap_ID %in% c("10B", "10V", "30F", "40E", "40F", "50M", "50N", "60C", "60J", "60L",
+                                                          "60P", "60R", "220_", "270AB", "270B", "270K", "270O", "270Q", "350E",
+                                                          "400H", "420G", "420K", "490J", "490S", "500I"))
+
+#Only 25 sites had enough camera data for the time-series analysis
+
+# I want all the constrained C matrices to have the same number of groups since I don't want the level of complexity (2 groups vs 6 groups) to influence the AICc score. Given I only have 25 sites, and 4 drivers (covariates), having 2 bins for a variable would mean 2x4=8 parameters are being estimated, which is already quite high when n = 25.
+
+Cmatrices_variables <- c("age", "slope", "TPH", "avg_shrub_ht", "per_shrub_cover", "BA", "neighbor_ht", "size", "small_tree_ratio", "northness", "eastness")
+
+for (var in Cmatrices_variables) {
+  hist(allvariables_TSA[[var]], breaks=2, main=paste("Histogram of", var), xlab=var)
+}
+
+# Store results
+kmeans_breaks_results <- list()
+
+for (var in Cmatrices_variables) {
+  
+  # Get variable data and remove NAs
+  var_data <- allvariables_TSA[[var]]
+  var_data_clean <- var_data[!is.na(var_data)]
+  
+  # Perform k-means clustering with k=2
+  km_result <- kmeans(var_data_clean, centers = 2, nstart = 20)
+  
+  # Get the cluster centers
+  centers <- sort(km_result$centers[,1])
+  
+  # Create break point at midpoint between the two centers
+  break_point <- mean(centers)
+  
+  # Create full breaks vector (min, break_point, max)
+  breaks <- c(min(var_data_clean), break_point, max(var_data_clean))
+  
+  # Calculate R-squared (proportion of variance explained)
+  total_ss <- sum((var_data_clean - mean(var_data_clean))^2)
+  r_squared <- 1 - (km_result$tot.withinss / total_ss)
+  
+  # Create labels
+  labels <- paste0(var, c("1", "2"))
+  
+  # Create binned variable
+  binned_var <- cut(var_data, breaks = breaks, labels = labels, include.lowest = TRUE)
+  
+  # Add binned variable to dataset
+  allvariables_TSA[[paste0(var, "_bin")]] <- binned_var
+  
+  # Store results
+  kmeans_breaks_results[[var]] <- list(
+    breaks = breaks,
+    break_point = break_point,
+    centers = centers,
+    r_squared = r_squared,
+    labels = labels,
+    group_sizes = table(binned_var, useNA = "ifany")
+  )
+  
+  # Create histogram showing the break
+  hist(var_data_clean, breaks = 10, main = paste("K-means Break for", var), 
+       xlab = var, col = "lightblue")
+  abline(v = break_point, col = "red", lwd = 2, lty = 2)
+  text(break_point, par("usr")[4] * 0.9, 
+       paste("Break:", round(break_point, 2)), 
+       pos = 4, col = "red")
+}
+
+# Create summary table
+summary_df <- data.frame(
+  Variable = names(kmeans_breaks_results),
+  Break_Point = round(sapply(kmeans_breaks_results, function(x) x$break_point), 2),
+  R_Squared = round(sapply(kmeans_breaks_results, function(x) x$r_squared), 3),
+  Low_Group_Size = sapply(kmeans_breaks_results, function(x) x$group_sizes[1]),
+  High_Group_Size = sapply(kmeans_breaks_results, function(x) x$group_sizes[2])
+)
+
+print(summary_df)
+```
+Step 2: Create the bins based on the k-means clustering 
+```{r, eval = FALSE} 
+# C matrix for Age
+allvariables_TSA$age_bin <- cut(allvariables_TSA$age,
+                                breaks = c(0, 25.83, Inf),
+                                labels = c("age-low", "age-high"),
+                                right = TRUE, include.lowest = TRUE)
+
+# Create data frame for the age constrained C matrix
+covariates <- c("temp", "PxT", "solrad", "wind")
+age <- data.frame(matrix(ncol = length(covariates), nrow = nrow(allvariables_TSA)))
+colnames(age) <- covariates
+
+# Fill in the C matrix labels based on age_bin
+for (i in 1:ncol(age)) {
+  age[, i] <- paste0(allvariables_TSA$age_bin, ".", covariates[i])
+}
+# Make the data frame into a matrix
+age <- as.matrix(age)
+
+##########################################################################################
+
+# C matrix for Slope
+allvariables_TSA$slope_bin <- cut(allvariables_TSA$slope,
+                                breaks = c(0, 20.31, Inf),
+                                labels = c("slope-low", "slope-high"),
+                                right = TRUE, include.lowest = TRUE) #check bins are assigned properly
+
+# Create data frame for the slope constrained C matrix
+slope <- data.frame(matrix(ncol = length(covariates), nrow = nrow(allvariables_TSA)))
+colnames(slope) <- covariates
+
+# Fill in the C matrix labels based on slope_bin
+for (i in 1:ncol(slope)) {
+  slope[, i] <- paste0(allvariables_TSA$slope_bin, ".", covariates[i])
+}
+# Make the data frame into a matrix
+slope <- as.matrix(slope)
+
+##########################################################################################
+
+# C matrix for Trees per Hectare
+allvariables_TSA$TPH_bin <- cut(allvariables_TSA$TPH,
+                                breaks = c(0, 2562.48, Inf),
+                                labels = c("TPH-low", "TPH-high"),
+                                right = TRUE, include.lowest = TRUE) #check bins are assigned properly
+
+# Create data frame for the TPH constrained C matrix
+TPH <- data.frame(matrix(ncol = length(covariates), nrow = nrow(allvariables_TSA)))
+colnames(TPH) <- covariates
+
+# Fill in the C matrix labels based on TPH_bin
+for (i in 1:ncol(TPH)) {
+  TPH[, i] <- paste0(allvariables_TSA$TPH_bin, ".", covariates[i])
+}
+
+# Make the data frame into a matrix
+TPH <- as.matrix(TPH)
+
+##########################################################################################
+
+
+# C matrix for average shrub height
+allvariables_TSA$shrubht_bin <- cut(allvariables_TSA$avg_shrub_ht,
+                                breaks = c(0,  0.85, Inf),
+                                labels = c("shrubht-low", "shrubht-high"),
+                                right = TRUE, include.lowest = TRUE) #check bins are assigned properly
+
+# Create data frame for the avg shrub height constrained C matrix
+shrubht <- data.frame(matrix(ncol = length(covariates), nrow = nrow(allvariables_TSA)))
+colnames(shrubht) <- covariates
+
+# Fill in the C matrix labels based on shrubht_bin
+for (i in 1:ncol(shrubht)) {
+  shrubht[, i] <- paste0(allvariables_TSA$shrubht_bin, ".", covariates[i])
+}
+
+# Make the data frame into a matrix
+shrubht <- as.matrix(shrubht)
+
+##########################################################################################
+
+
+# C matrix for percent shrub cover
+allvariables_TSA$shrubcov_bin <- cut(allvariables_TSA$per_shrub_cover,
+                                breaks = c(0, 21.00, Inf),
+                                labels = c("shrubcov-low", "shrubcov-high"),
+                                right = TRUE, include.lowest = TRUE) #check bins are assigned properly
+
+# Create data frame for the percent shrub cover constrained C matrix
+shrubcov <- data.frame(matrix(ncol = length(covariates), nrow = nrow(allvariables_TSA)))
+colnames(shrubcov) <- covariates
+
+# Fill in the C matrix labels based on shrubcov_bin
+for (i in 1:ncol(shrubcov)) {
+  shrubcov[, i] <- paste0(allvariables_TSA$shrubcov_bin, ".", covariates[i])
+}
+
+# Make the data frame into a matrix
+shrubcov <- as.matrix(shrubcov)
+
+
+##########################################################################################
+
+# C matrix for Basal Area
+allvariables_TSA$BA_bin <- cut(allvariables_TSA$BA,
+                                breaks = c(0,  26.23, Inf), 
+                                labels = c("BA-low", "BA-high"),
+                                right = TRUE, include.lowest = TRUE) #check bins are assigned properly
+
+# Create data frame for the BA constrained C matrix
+BA <- data.frame(matrix(ncol = length(covariates), nrow = nrow(allvariables_TSA)))
+colnames(BA) <- covariates
+
+# Fill in the C matrix labels based on BA_bin
+for (i in 1:ncol(BA)) {
+  BA[, i] <- paste0(allvariables_TSA$BA_bin, ".", covariates[i])
+}
+
+# Make the data frame into a matrix
+BA <- as.matrix(BA)
+
+
+##########################################################################################
+
+# C matrix for neighboring tree heights
+allvariables_TSA$neighbor_ht_bin <- cut(allvariables_TSA$neighbor_ht,
+                                breaks = c(0, 19.15, Inf),
+                                labels = c("neighbor_ht-low", "neighbor_ht-high"),
+                                right = TRUE, include.lowest = TRUE) #check bins are assigned properly
+
+# Create data frame for the neighbor_ht constrained C matrix
+neighbor_ht <- data.frame(matrix(ncol = length(covariates), nrow = nrow(allvariables_TSA)))
+colnames(neighbor_ht) <- covariates
+
+# Fill in the C matrix labels based on neighbor_ht
+for (i in 1:ncol(neighbor_ht)) {
+  neighbor_ht[, i] <- paste0(allvariables_TSA$neighbor_ht_bin, ".", covariates[i])
+}
+
+# Make the data frame into a matrix
+neighbor_ht <- as.matrix(neighbor_ht)
+
+
+##########################################################################################
+
+# C matrix for gap size
+allvariables_TSA$size_bin <- cut(allvariables_TSA$size,
+                                breaks = c(0, 0.43, Inf),
+                                labels = c("size-low", "size-high"),
+                                right = TRUE, include.lowest = TRUE) #check bins are assigned properly
+
+# Create data frame for the size constrained C matrix
+size <- data.frame(matrix(ncol = length(covariates), nrow = nrow(allvariables_TSA)))
+colnames(size) <- covariates
+
+# Fill in the C matrix labels based on size_bin
+for (i in 1:ncol(size)) {
+  size[, i] <- paste0(allvariables_TSA$size_bin, ".", covariates[i])
+}
+
+# Make the data frame into a matrix
+size <- as.matrix(size)
+
+
+##########################################################################################
+
+# C matrix for small_tree_ratio 
+allvariables_TSA$small_tree_ratio_bin <- cut(allvariables_TSA$small_tree_ratio,
+                                breaks = c(0, 0.68, Inf),
+                                labels = c("small_tree_ratio-low", "small_tree_ratio-high"),
+                                right = TRUE, include.lowest = TRUE) #check bins are assigned properly
+
+# Create data frame for the small_tree_ratio constrained C matrix
+small_tree_ratio <- data.frame(matrix(ncol = length(covariates), nrow = nrow(allvariables_TSA)))
+colnames(small_tree_ratio) <- covariates
+
+# Fill in the C matrix labels based on size_bin
+for (i in 1:ncol(small_tree_ratio)) {
+  small_tree_ratio[, i] <- paste0(allvariables_TSA$small_tree_ratio_bin, ".", covariates[i])
+}
+
+# Make the data frame into a matrix
+small_tree_ratio <- as.matrix(small_tree_ratio)
+
+# Note! Two of the 25 sites had zero trees (they were very young canopy gaps), so the small tree ratio is NaN (because small--tree-ration = TPH < 7.6 cm / TPH total), and TPH Total was 0
+# Not sure if this will lead to the MARSS model inherently being simpler
+
+
+##########################################################################################
+
+# C matrix for northness
+allvariables_TSA$northness_bin <- cut(allvariables_TSA$northness,
+                                breaks = c(-1, -0.08, Inf),
+                                labels = c("northness-south", "northness-north"),
+                                right = TRUE, include.lowest = TRUE) #check bins are assigned properly
+
+# Create data frame for the northness constrained C matrix
+northness <- data.frame(matrix(ncol = length(covariates), nrow = nrow(allvariables_TSA)))
+colnames(northness) <- covariates
+
+# Fill in the C matrix labels based on size_bin
+for (i in 1:ncol(northness)) {
+  northness[, i] <- paste0(allvariables_TSA$northness_bin, ".", covariates[i])
+}
+
+# Make the data frame into a matrix
+northness <- as.matrix(northness)
+
+
+##########################################################################################
+
+# C matrix for eastness
+allvariables_TSA$eastness_bin <- cut(allvariables_TSA$eastness,
+                                breaks = c(-1,  -0.10, Inf),
+                                labels = c("eastness-west", "eastness-east"),
+                                right = TRUE, include.lowest = TRUE) #check bins are assigned properly
+
+# Create data frame for the eastness constrained C matrix
+eastness <- data.frame(matrix(ncol = length(covariates), nrow = nrow(allvariables_TSA)))
+colnames(eastness) <- covariates
+
+# Fill in the C matrix labels based on size_bin
+for (i in 1:ncol(eastness)) {
+  eastness[, i] <- paste0(allvariables_TSA$eastness_bin, ".", covariates[i])
+}
+
+# Make the data frame into a matrix
+eastness <- as.matrix(eastness)
+```
+
+Set up the Model runs
+```{r, eval = FALSE} 
+#Set up other MARSS model parameters
+plots = 25 # 25 plots
+nsteps = 73 # 73 days from 1/21/21 and 4/3/21 (including both end dates) 1/21/21 is when the first snow from a storm stuck around.
+```
+
+Run the control (unconstrained) and constrained models. Create forloop with unconstrained M matrix and constrained C matrices
+First, set up for loop to set up the constrained C matrix models
+```{r, eval = FALSE} 
+Cmatrix_setup_list <- c("control", "age", "slope", "TPH", "shrubht", "shrubcov", "BA", "neighbor_ht", "size", "small_tree_ratio", "northness", "eastness")
+
+Cmodels <- list()
+
+for (name in Cmatrix_setup_list) {
+  mod <- list()
+  # Define the parameters in the X equation (process model)
+  mod$B <- "identity" # because snow depth in one plot shouldn't affect snow depth at another plot
+  mod$U <- "unequal" # set drift to not equal zero
+  mod$Q <- "diagonal and unequal"
+  mod$C <- get(name)  # gets the matrix by its name from the environment. Dimensions are 25x4 since we have 25 states and 4 covariates
+  mod$c <- transformed_covar
+  
+ # Define the parameters in the Y equation (observation model)
+  mod$Z <- "identity" # The way snow depth was measured was straightforward- nothing to indicate that there are any inherent differences between how snow depth was measured and actual snow depth across the sites
+  mod$R <- "diagonal and equal"
+  mod$A <- "zero"
+  
+  # Save to Cmodels list
+  Cmodels[[paste0("mod.1.", name)]] <- mod
+}
+
+```
+
+Run the models separately (not using a for loop since the my laptop couldn't handle it) #This is the results for 2 bins
+```{r, eval = FALSE} 
+control<- MARSS(zscore(dat), model = Cmodels[["mod.1.control"]], control = list(maxit = 10000)) #Took one hour to run, and reached abstol convergence only. AIC: 1057.14   AICc: 1101.706 
+age<- MARSS(zscore(dat), model = Cmodels[["mod.1.age"]], control = list(maxit = 10000)) #AIC: 946.4517   AICc: 956.0356   
+slope<- MARSS(zscore(dat), model = Cmodels[["mod.1.slope"]], control = list(maxit = 10000)) #AIC: 945.3947   AICc: 954.9786   
+TPH <- MARSS(zscore(dat), model = Cmodels[["mod.1.TPH"]], control = list(maxit = 10000)) #AIC: 943.1805   AICc: 952.7644   
+shrubht<- MARSS(zscore(dat), model = Cmodels[["mod.1.shrubht"]], control = list(maxit = 10000)) #AIC: 945.7454   AICc: 955.3293   
+shrubcov<- MARSS(zscore(dat), model = Cmodels[["mod.1.shrubcov"]], control = list(maxit = 10000)) #AIC: 945.3005   AICc: 954.8844  
+BA<- MARSS(zscore(dat), model = Cmodels[["mod.1.BA"]], control = list(maxit = 10000)) #AIC: 941.4609   AICc: 951.0447   
+neighbor_ht<- MARSS(zscore(dat), model = Cmodels[["mod.1.neighbor_ht"]], control = list(maxit = 10000)) #AIC: 947.5037   AICc: 957.0876   
+size<- MARSS(zscore(dat), model = Cmodels[["mod.1.size"]], control = list(maxit = 10000)) #IC: 947.1827   AICc: 956.7666   
+small_tree_ratio<- MARSS(zscore(dat), model = Cmodels[["mod.1.small_tree_ratio"]], control = list(maxit = 10000)) #AIC: 947.5394   AICc: 958.0804     
+northness<- MARSS(zscore(dat), model = Cmodels[["mod.1.northness"]], control = list(maxit = 10000)) #AIC: 946.4409   AICc: 956.0248    
+eastness<- MARSS(zscore(dat), model = Cmodels[["mod.1.eastness"]], control = list(maxit = 10000)) #AIC: 945.8936   AICc: 955.4775 
+```
+AICc scores (from lowest to highest):
+951.0447 - BA
+952.7644 - TPH
+954.8844 - shrubcov
+954.9786 - slope
+955.3293 - shrubht
+955.4775 - eastness
+956.0248 - northness
+956.0356 - age
+956.7666 - size
+957.0876 - neighbor_ht
+958.0804 - small_tree_ratio
+
+PART 2
+Set up C matrices for the constrained models (mod.2.XXX)
+TRYING 3 BINS (3 bins x 4 drivers = 12 parameters to estimate)
+Step 1: create bins for the variables of interest- find the natural break for two bins per variable
+```{r, eval = FALSE, fig.show='hold', fig.width=12, fig.height=9}
+Cmatrices_variables <- c("age", "slope", "TPH", "avg_shrub_ht", "per_shrub_cover", "BA", "neighbor_ht", "size", "small_tree_ratio", "northness", "eastness")
+
+for (var in Cmatrices_variables) {
+  hist(allvariables_TSA[[var]], breaks=3, main=paste("Histogram of", var), xlab=var)
+}
+
+# Store results
+kmeans_breaks_results <- list()
+
+for (var in Cmatrices_variables) {
+  
+  # Get variable data and remove NAs
+  var_data <- allvariables_TSA[[var]]
+  var_data_clean <- var_data[!is.na(var_data)]
+  
+  # Perform k-means clustering with k=3
+  km_result <- kmeans(var_data_clean, centers = 3, nstart = 20)
+  
+  # Get the cluster centers
+  centers <- sort(km_result$centers[,1])
+  
+  # Create break points at midpoints between the three centers
+  break_point1 <- (centers[1] + centers[2]) / 2
+  break_point2 <- (centers[2] + centers[3]) / 2
+  
+  # Create full breaks vector (min, break1, break2, max)
+  breaks <- c(min(var_data_clean), break_point1, break_point2, max(var_data_clean))
+  
+  # Calculate R-squared (proportion of variance explained)
+  total_ss <- sum((var_data_clean - mean(var_data_clean))^2)
+  r_squared <- 1 - (km_result$tot.withinss / total_ss)
+  
+  # Create labels
+  labels <- paste0(var, c("1", "2", "3"))
+  
+  # Create binned variable
+  binned_var <- cut(var_data, breaks = breaks, labels = labels, include.lowest = TRUE)
+  
+  # Add binned variable to dataset
+  allvariables_TSA[[paste0(var, "_bin")]] <- binned_var
+  
+  # Store results
+  kmeans_breaks_results[[var]] <- list(
+  break_point1 = break_point1,
+  break_point2 = break_point2,
+  breaks = breaks,
+  centers = centers,
+  r_squared = r_squared,
+  labels = labels,
+  group_sizes = table(binned_var, useNA = "ifany")
+)
+  
+  # Create histogram showing the break
+  hist(var_data_clean, breaks = 10, main = paste("K-means Breaks for", var), 
+       xlab = var, col = "lightblue")
+  abline(v = break_point1, col = "red", lwd = 2, lty = 2)
+  abline(v = break_point2, col = "red", lwd = 2, lty = 2)
+  text(break_point1, par("usr")[4] * 0.9, 
+       paste("Break1:", round(break_point1, 2)), 
+       pos = 4, col = "red")
+  text(break_point2, par("usr")[4] * 0.8, 
+       paste("Break2:", round(break_point2, 2)), 
+       pos = 4, col = "red")
+}
+
+# Create summary table
+summary_df <- data.frame(
+  Variable = names(kmeans_breaks_results),
+  Break_Point1 = round(sapply(kmeans_breaks_results, function(x) x$break_point1), 2),
+  Break_Point2 = round(sapply(kmeans_breaks_results, function(x) x$break_point2), 2),
+  R_Squared = round(sapply(kmeans_breaks_results, function(x) x$r_squared), 3),
+  Group1_Size = sapply(kmeans_breaks_results, function(x) x$group_sizes[1]),
+  Group2_Size = sapply(kmeans_breaks_results, function(x) x$group_sizes[2]),
+  Group3_Size = sapply(kmeans_breaks_results, function(x) x$group_sizes[3])
+)
+
+print(summary_df)
+#not sure why we the labels for the variables have been changed slightly, but the break points are correct if we check against the histograms. And each group has at least 2 sites, which is the least we can ask for.
+
+```
+Step 2: Create the 3 bins based on the k-means clustering 
+```{r, eval = FALSE} 
+# C matrix for Age
+allvariables_TSA$age_bin <- cut(allvariables_TSA$age,
+                                breaks = c(0, 14.55, 33.06, Inf),
+                                labels = c("age-low", "age-med", "age-high"),
+                                right = TRUE, include.lowest = TRUE)
+
+# Create data frame for the age constrained C matrix
+covariates <- c("temp", "PxT", "solrad", "wind")
+age <- data.frame(matrix(ncol = length(covariates), nrow = nrow(allvariables_TSA)))
+colnames(age) <- covariates
+
+# Fill in the C matrix labels based on age_bin
+for (i in 1:ncol(age)) {
+  age[, i] <- paste0(allvariables_TSA$age_bin, ".", covariates[i])
+}
+# Make the data frame into a matrix
+age <- as.matrix(age)
+
+##########################################################################################
+
+# C matrix for Slope
+allvariables_TSA$slope_bin <- cut(allvariables_TSA$slope,
+                                breaks = c(0, 13.82, 23.88, Inf),
+                                labels = c("slope-low","slope-med", "slope-high"),
+                                right = TRUE, include.lowest = TRUE) #check bins are assigned properly
+
+# Create data frame for the slope constrained C matrix
+slope <- data.frame(matrix(ncol = length(covariates), nrow = nrow(allvariables_TSA)))
+colnames(slope) <- covariates
+
+# Fill in the C matrix labels based on slope_bin
+for (i in 1:ncol(slope)) {
+  slope[, i] <- paste0(allvariables_TSA$slope_bin, ".", covariates[i])
+}
+# Make the data frame into a matrix
+slope <- as.matrix(slope)
+
+##########################################################################################
+
+# C matrix for Trees per Hectare
+allvariables_TSA$TPH_bin <- cut(allvariables_TSA$TPH,
+                                breaks = c(0, 1958.79, 4327.43, Inf),
+                                labels = c("TPH-low", "TPH-med", "TPH-high"),
+                                right = TRUE, include.lowest = TRUE) #check bins are assigned properly
+
+# Create data frame for the TPH constrained C matrix
+TPH <- data.frame(matrix(ncol = length(covariates), nrow = nrow(allvariables_TSA)))
+colnames(TPH) <- covariates
+
+# Fill in the C matrix labels based on TPH_bin
+for (i in 1:ncol(TPH)) {
+  TPH[, i] <- paste0(allvariables_TSA$TPH_bin, ".", covariates[i])
+}
+
+# Make the data frame into a matrix
+TPH <- as.matrix(TPH)
+
+##########################################################################################
+
+
+# C matrix for average shrub height
+allvariables_TSA$shrubht_bin <- cut(allvariables_TSA$avg_shrub_ht,
+                                breaks = c(0,  0.67, 1.72, Inf),
+                                labels = c("shrubht-low", "shrubht-med", "shrubht-high"),
+                                right = TRUE, include.lowest = TRUE) #check bins are assigned properly
+
+# Create data frame for the avg shrub height constrained C matrix
+shrubht <- data.frame(matrix(ncol = length(covariates), nrow = nrow(allvariables_TSA)))
+colnames(shrubht) <- covariates
+
+# Fill in the C matrix labels based on shrubht_bin
+for (i in 1:ncol(shrubht)) {
+  shrubht[, i] <- paste0(allvariables_TSA$shrubht_bin, ".", covariates[i])
+}
+
+# Make the data frame into a matrix
+shrubht <- as.matrix(shrubht)
+
+##########################################################################################
+
+
+# C matrix for percent shrub cover
+allvariables_TSA$shrubcov_bin <- cut(allvariables_TSA$per_shrub_cover,
+                                breaks = c(0, 10.81, 33.23, Inf),
+                                labels = c("shrubcov-low", "shrubcov-med", "shrubcov-high"),
+                                right = TRUE, include.lowest = TRUE) #check bins are assigned properly
+
+# Create data frame for the percent shrub cover constrained C matrix
+shrubcov <- data.frame(matrix(ncol = length(covariates), nrow = nrow(allvariables_TSA)))
+colnames(shrubcov) <- covariates
+
+# Fill in the C matrix labels based on shrubcov_bin
+for (i in 1:ncol(shrubcov)) {
+  shrubcov[, i] <- paste0(allvariables_TSA$shrubcov_bin, ".", covariates[i])
+}
+
+# Make the data frame into a matrix
+shrubcov <- as.matrix(shrubcov)
+
+
+##########################################################################################
+
+# C matrix for Basal Area
+allvariables_TSA$BA_bin <- cut(allvariables_TSA$BA,
+                                breaks = c(0,  22.38, 54.04, Inf),
+                                labels = c("BA-low", "BA-med", "BA-high"),
+                                right = TRUE, include.lowest = TRUE) #check bins are assigned properly
+
+# Create data frame for the BA constrained C matrix
+BA <- data.frame(matrix(ncol = length(covariates), nrow = nrow(allvariables_TSA)))
+colnames(BA) <- covariates
+
+# Fill in the C matrix labels based on BA_bin
+for (i in 1:ncol(BA)) {
+  BA[, i] <- paste0(allvariables_TSA$BA_bin, ".", covariates[i])
+}
+
+# Make the data frame into a matrix
+BA <- as.matrix(BA)
+
+
+##########################################################################################
+
+# C matrix for neighboring tree heights
+allvariables_TSA$neighbor_ht_bin <- cut(allvariables_TSA$neighbor_ht,
+                                breaks = c(0, 14.22, 35.15, Inf),
+                                labels = c("neighbor_ht-low", "neighbor_ht-med", "neighbor_ht-high"),
+                                right = TRUE, include.lowest = TRUE) #check bins are assigned properly
+
+# Create data frame for the neighbor_ht constrained C matrix
+neighbor_ht <- data.frame(matrix(ncol = length(covariates), nrow = nrow(allvariables_TSA)))
+colnames(neighbor_ht) <- covariates
+
+# Fill in the C matrix labels based on neighbor_ht
+for (i in 1:ncol(neighbor_ht)) {
+  neighbor_ht[, i] <- paste0(allvariables_TSA$neighbor_ht_bin, ".", covariates[i])
+}
+
+# Make the data frame into a matrix
+neighbor_ht <- as.matrix(neighbor_ht)
+
+
+##########################################################################################
+
+# C matrix for gap size
+allvariables_TSA$size_bin <- cut(allvariables_TSA$size,
+                                breaks = c(0, 0.26, 0.45, Inf),
+                                labels = c("size-low", "size-med", "size-high"),
+                                right = TRUE, include.lowest = TRUE) #check bins are assigned properly
+
+# Create data frame for the size constrained C matrix
+size <- data.frame(matrix(ncol = length(covariates), nrow = nrow(allvariables_TSA)))
+colnames(size) <- covariates
+
+# Fill in the C matrix labels based on size_bin
+for (i in 1:ncol(size)) {
+  size[, i] <- paste0(allvariables_TSA$size_bin, ".", covariates[i])
+}
+
+# Make the data frame into a matrix
+size <- as.matrix(size)
+
+
+##########################################################################################
+
+# C matrix for small_tree_ratio 
+allvariables_TSA$small_tree_ratio_bin <- cut(allvariables_TSA$small_tree_ratio,
+                                breaks = c(0, 0.38, 0.72, Inf),
+                                labels = c("small_tree_ratio-low", "small_tree_ratio-med", "small_tree_ratio-high"),
+                                right = TRUE, include.lowest = TRUE) #check bins are assigned properly
+
+# Create data frame for the small_tree_ratio constrained C matrix
+small_tree_ratio <- data.frame(matrix(ncol = length(covariates), nrow = nrow(allvariables_TSA)))
+colnames(small_tree_ratio) <- covariates
+
+# Fill in the C matrix labels based on size_bin
+for (i in 1:ncol(small_tree_ratio)) {
+  small_tree_ratio[, i] <- paste0(allvariables_TSA$small_tree_ratio_bin, ".", covariates[i])
+}
+
+# Make the data frame into a matrix
+small_tree_ratio <- as.matrix(small_tree_ratio)
+
+# Note! Two of the 25 sites had zero trees (they were very young canopy gaps), so the small tree ratio is NaN (because small--tree-ration = TPH < 7.6 cm / TPH total), and TPH Total was 0
+# Not sure if this will lead to the MARSS model inherently being simpler
+
+
+##########################################################################################
+
+# C matrix for northness
+allvariables_TSA$northness_bin <- cut(allvariables_TSA$northness,
+                                breaks = c(-1, -0.4, 0.22, Inf),
+                                labels = c("northness-south", "northness-med", "northness-north"),
+                                right = TRUE, include.lowest = TRUE) #check bins are assigned properly
+
+# Create data frame for the northness constrained C matrix
+northness <- data.frame(matrix(ncol = length(covariates), nrow = nrow(allvariables_TSA)))
+colnames(northness) <- covariates
+
+# Fill in the C matrix labels based on size_bin
+for (i in 1:ncol(northness)) {
+  northness[, i] <- paste0(allvariables_TSA$northness_bin, ".", covariates[i])
+}
+
+# Make the data frame into a matrix
+northness <- as.matrix(northness)
+
+
+##########################################################################################
+
+# C matrix for eastness
+allvariables_TSA$eastness_bin <- cut(allvariables_TSA$eastness,
+                                breaks = c(-1,  -0.32, 0.18, Inf),
+                                labels = c("eastness-west", "eastness-med", "eastness-east"),
+                                right = TRUE, include.lowest = TRUE) #check bins are assigned properly
+
+# Create data frame for the eastness constrained C matrix
+eastness <- data.frame(matrix(ncol = length(covariates), nrow = nrow(allvariables_TSA)))
+colnames(eastness) <- covariates
+
+# Fill in the C matrix labels based on size_bin
+for (i in 1:ncol(eastness)) {
+  eastness[, i] <- paste0(allvariables_TSA$eastness_bin, ".", covariates[i])
+}
+
+# Make the data frame into a matrix
+eastness <- as.matrix(eastness)
+```
+
+Set up the Model runs
+```{r, eval = FALSE} 
+#Set up other MARSS model parameters
+plots = 25 # 25 plots
+nsteps = 73 # 73 days from 1/21/21 and 4/3/21 (including both end dates) 1/21/21 is when the first snow from a storm stuck around.
+```
+
+Run the control (unconstrained) and constrained models. Create forloop with unconstrained M matrix and constrained C matrices
+First, set up for loop to set up the constrained C matrix models
+```{r, eval = FALSE} 
+Cmatrix_setup_list <- c("control", "age", "slope", "TPH", "shrubht", "shrubcov", "BA", "neighbor_ht", "size", "small_tree_ratio", "northness", "eastness")
+
+for (name in Cmatrix_setup_list) {
+  mod <- list()
+  # Define the parameters in the X equation (process model)
+  mod$B <- "identity" # because snow depth in one plot shouldn't affect snow depth at another plot
+  mod$U <- "unequal" # set drift to not equal zero
+  mod$Q <- "diagonal and unequal"
+  mod$C <- get(name)  # gets the matrix by its name from the environment. Dimensions are 25x4 since we have 25 states and 4 covariates
+  mod$c <- transformed_covar
+  
+ # Define the parameters in the Y equation (observation model)
+  mod$Z <- "identity" # The way snow depth was measured was straightforward- nothing to indicate that there are any inherent differences between how snow depth was measured and actual snow depth across the sites
+  mod$R <- "diagonal and equal"
+  mod$A <- "zero"
+  
+  # Save to Cmodels list
+  Cmodels[[paste0("mod.2.", name)]] <- mod
+}
+
+```
+
+Run the models separately (not using a for loop since the my laptop couldn't handle it). This is the results for 3 bins
+```{r, eval = FALSE} 
+# control<- MARSS(zscore(dat), model = Cmodels[["mod.1.control"]], control = list(maxit = 10000)) #Took one hour to run, and reached abstol convergence only. AIC: 1057.14   AICc: 1101.706 #not running control this time because this would be the same as before
+age<- MARSS(zscore(dat), model = Cmodels[["mod.2.age"]], control = list(maxit = 10000)) #AIC: 953.9093   AICc: 964.4503   
+slope<- MARSS(zscore(dat), model = Cmodels[["mod.2.slope"]], control = list(maxit = 10000)) #AIC: 953.073   AICc: 963.6141   
+TPH <- MARSS(zscore(dat), model = Cmodels[["mod.2.TPH"]], control = list(maxit = 10000)) #AIC: AIC: 943.4162   AICc: 953.9572   
+shrubht<- MARSS(zscore(dat), model = Cmodels[["mod.2.shrubht"]], control = list(maxit = 10000)) #AIC: 952.4219   AICc: 962.9629   
+shrubcov<- MARSS(zscore(dat), model = Cmodels[["mod.2.shrubcov"]], control = list(maxit = 10000)) #AIC: 944.8724   AICc: 955.4135  
+BA<- MARSS(zscore(dat), model = Cmodels[["mod.2.BA"]], control = list(maxit = 10000)) #AIC: 949.2331   AICc: 959.7742    
+neighbor_ht<- MARSS(zscore(dat), model = Cmodels[["mod.2.neighbor_ht"]], control = list(maxit = 10000)) #AIC: 949.9101   AICc: 960.4512  
+size<- MARSS(zscore(dat), model = Cmodels[["mod.2.size"]], control = list(maxit = 10000)) #AIC: 953.7557   AICc: 964.2967   
+small_tree_ratio<- MARSS(zscore(dat), model = Cmodels[["mod.2.small_tree_ratio"]], control = list(maxit = 10000)) #AIC: 953.329   AICc: 964.8756      
+northness<- MARSS(zscore(dat), model = Cmodels[["mod.2.northness"]], control = list(maxit = 10000)) #AIC: 949.5274   AICc: 960.0685  
+eastness<- MARSS(zscore(dat), model = Cmodels[["mod.2.eastness"]], control = list(maxit = 10000)) #AIC: 951.2968   AICc: 961.8378   
+```
+AICc scores (from lowest to highest):
+953.9572 - TPH
+955.4135 - shrubcover
+959.7742 - BA
+960.0685 - northness
+960.4512 - neighbor_ht
+961.8378 - eastness
+962.9629 - shrubht
+963.6141 - slope
+964.2967 - size
+964.4503 - age
+964.8756 - small tree ratio
+
+
+Based on the AICc scores, the MARSS models with 2 bins tend to do better than the models with 3 bins. We see that in niether case, grouping by age leads to a better time-series model compared to other site characteristics. However, we do see somewhat of a pattern in that the best three performing models are BA, TPH, shrubcover (regardless of whether we have 2 bins or 3 bins). With 2 bins, the best models based on AICc scores are: 1) BA, 2) TPH, and 3) shrub cover. With 3 bins, the best models based on AICc scores are 1) TPH, 2) shrub cover and 3) BA
+
+```{r, eval = FALSE} 
+variable<-c("BA", "TPH", "shrubcover")
+AICc_2bins <- c(951.0447, 952.7644, 954.8844)
+AICc_3bins <- c(959.7742, 953.9572, 955.4135)
+
+MARSS_best3 <- data.frame(Variable=variable,AICc_2bins=AICc_2bins,AICc_3bins=AICc_3bins)
+MARSS_best3
+```
+Looking at the AICc scores side by side, it looks like going from 3 bins to 2 bins only marginally improves the TPH- and shrubcover-contrained MARSS models, but improves the BA-contrained MARSS model by a lot. Because the BA-constrained MARSS model has the lowest AICc score, that is what we will use for the bootstrapping
+
+First go back in the code and rerun for mod.1.BA, because the code was written such that mod.2.BA might have overwritten the parameter settings and bins
+
+Next- bootstrapping to get 95% confidence intervals and standard errors for the parameter estimates of mod.1.BA since it has the lowest AICc score. Bootstrapping will also help compensate for the complex model structure and small sample size I have.
+```{r, eval = FALSE} 
+# Bootstrapping- need to specifiy parametric for the method, otherwise it automatically uses Hessian methods and doesn't actually do the bootstrapping properly. This took about 6 days to run.
+BA.boot <- MARSSparamCIs(BA, nboot = 1000, method = "parametric", silent = FALSE)
+BA.boot # view the outcomes of the bootstrapping
+```
+
+Extract the coefficients and confidence intervals for the covariate estimates
+```{r, eval = FALSE} 
+print(str(BA.boot, max.level = 2)) # From here we can see that the C coefficients are actually stored in the U parameter. The U parameter represents the drift/trend terms, and when you include covariates in the process equation, their effects get incorporated into the U parameter structure.
+
+#Check to see all of the C coefficients are the U list
+rownames(BA.boot$par$U) 
+
+# Get parameter names
+u_param_names <- rownames(BA.boot$par$U)
+C_param_names <- u_param_names[1:16]
+
+# Extract the parameter values and CIs from U list
+u_estimates <- BA.boot$par$U[, 1]  # Extract the first (and only) column
+C_estimates <-u_estimates[1:16]
+C_estimates <- as.numeric(C_estimates)
+
+u_lower_ci <- BA.boot$par.lowCI$U[, 1]
+C_lower_CI <- u_lower_ci[1:16]
+
+u_upper_ci <- BA.boot$par.upCI$U[, 1]
+C_upper_ci <- u_upper_ci[1:16]
+
+u_se <- BA.boot$par.se$U[, 1]
+C_se <- u_se[1:16]
+
+u_bias <- BA.boot$par.bias$U[, 1]
+C_bias <- u_bias[1:16]
+
+C.df <- data.frame(
+  variable = C_param_names,
+  estimate = C_estimates,
+  lower_ci = C_lower_CI,
+  upper_ci = C_upper_ci,
+  se = C_se,
+  bias = C_bias
+)
+```
+
+Create dot and whisker plots to visualize the driver effects (C matrix) and see if they are statistically significant
+```{r, eval = FALSE} 
+# Create variables to extract the BA group and variable type
+C.df$ba_group <- gsub("C\\.|\\.(temp|PxT|solrad|wind).*", "", C.df$variable)  # Extract BA group (BA-high, BA-low)
+C.df$var_type <- gsub(".*\\.(temp|PxT|solrad|wind).*", "\\1", C.df$variable)  # Extract variable type (temp, PxT, etc.)
+
+# Clean up the BA group names and create proper labels
+C.df$ba_group_label <- case_when(
+  C.df$ba_group == "BA-high" ~ "High BA",
+  C.df$ba_group == "BA-low" ~ "Low BA",
+  TRUE ~ C.df$ba_group  # Keep original if no match
+)
+
+# Convert to factor with proper ordering
+C.df$ba_group_label <- factor(C.df$ba_group_label, levels = c("Low BA", "High BA"))
+
+# Define colorblind-friendly palette for BA groups
+ba_colors <- c("Low BA" = "steelblue", "High BA" = "orange")
+
+# Create individual plots for each variable type
+# 1. Temperature effects
+temp_plot <- C.df[C.df$var_type == "temp", ] %>%
+  ggplot(aes(x = ba_group_label, y = estimate, color = ba_group_label)) +
+  geom_point(size = 3) +
+  geom_errorbar(aes(ymin = lower_ci, ymax = upper_ci), 
+                width = 0.2) +
+  geom_hline(yintercept = 0, linetype = "dashed", alpha = 0.5) +
+  scale_color_manual(values = ba_colors) +
+  labs(title = "Temperature Effects", tag="a)",
+       x = "Basal Area Group", 
+       y = "Coefficient Estimate") +
+  theme_minimal() +
+  theme(plot.title = element_text(hjust = 0.5, size = 11),
+        legend.position = "none",
+        plot.margin = margin(t = 20, r = 5, b = 5, l = 5))
+
+# 2. PxT (Precipitation x Temperature) effects  
+PxT_plot <- C.df[C.df$var_type == "PxT", ] %>%
+  ggplot(aes(x = ba_group_label, y = estimate, color = ba_group_label)) +
+  geom_point(size = 3) +
+  geom_errorbar(aes(ymin = lower_ci, ymax = upper_ci), 
+                width = 0.2) +
+  geom_hline(yintercept = 0, linetype = "dashed", alpha = 0.5) +
+  scale_color_manual(values = ba_colors) +
+  labs(title = "Precipitation × Temperature Effects", tag="b)",
+       x = "Basal Area Group", 
+       y = "Coefficient Estimate") +
+  theme_minimal() +
+  theme(plot.title = element_text(hjust = 0.5, size = 11),
+        legend.position = "none",
+        plot.margin = margin(t = 20, r = 5, b = 5, l = 5))
+
+# 3. Solar radiation effects
+solrad_plot <- C.df[C.df$var_type == "solrad", ] %>%
+  ggplot(aes(x = ba_group_label, y = estimate, color = ba_group_label)) +
+  geom_point(size = 3) +
+  geom_errorbar(aes(ymin = lower_ci, ymax = upper_ci), 
+                width = 0.2) +
+  geom_hline(yintercept = 0, linetype = "dashed", alpha = 0.5) +
+  scale_color_manual(values = ba_colors) +
+  labs(title = "Solar Radiation Effects", tag="c)",
+       x = "Basal Area Group", 
+       y = "Coefficient Estimate") +
+  theme_minimal() +
+  theme(plot.title = element_text(hjust = 0.5, size = 11),
+        legend.position = "none",
+        plot.margin = margin(t = 20, r = 5, b = 5, l = 5))
+
+# 4. Wind effects
+wind_plot <- C.df[C.df$var_type == "wind", ] %>%
+  ggplot(aes(x = ba_group_label, y = estimate, color = ba_group_label)) +
+  geom_point(size = 3) +
+  geom_errorbar(aes(ymin = lower_ci, ymax = upper_ci), 
+                width = 0.2) +
+  geom_hline(yintercept = 0, linetype = "dashed", alpha = 0.5) +
+  scale_color_manual(values = ba_colors) +
+  labs(title = "Wind Effects", tag="d)",
+       x = "Basal Area Group", 
+       y = "Coefficient Estimate") +
+  theme_minimal() +
+  theme(plot.title = element_text(hjust = 0.5, size = 11),
+        legend.position = "none",
+        plot.margin = margin(t = 20, r = 5, b = 5, l = 5))
+
+# Display individual plots
+temp_plot
+PxT_plot
+solrad_plot
+wind_plot
+
+# Create combined plot
+library(gridExtra)
+grid.arrange(temp_plot, PxT_plot, solrad_plot, wind_plot, ncol = 2)
+```
+Seeing if I can make a nice plot with them next to each other to compare magnitudes
+```{r, eval = FALSE} 
+r# Create variables to extract the BA group and variable type (your existing code)
+C.df$ba_group <- gsub("C\\.|\\.(temp|PxT|solrad|wind).*", "", C.df$variable)
+C.df$var_type <- gsub(".*\\.(temp|PxT|solrad|wind).*", "\\1", C.df$variable)
+
+C.df$ba_group_label <- case_when(
+  C.df$ba_group == "BA-high" ~ "High BA",
+  C.df$ba_group == "BA-low" ~ "Low BA",
+  TRUE ~ C.df$ba_group
+)
+
+C.df$ba_group_label <- factor(C.df$ba_group_label, levels = c("Low BA", "High BA"))
+
+# Rename variables for better display
+C.df$var_type_label <- case_when(
+  C.df$var_type == "temp" ~ "Temperature",
+  C.df$var_type == "PxT" ~ "Precipitation × Temperature",
+  C.df$var_type == "solrad" ~ "Solar Radiation",
+  C.df$var_type == "wind" ~ "Wind",
+  TRUE ~ C.df$var_type
+)
+
+# Order the variables logically
+C.df$var_type_label <- factor(C.df$var_type_label, 
+                             levels = c("Temperature", "Precipitation × Temperature", 
+                                      "Solar Radiation", "Wind"))
+
+# Define colors
+ba_colors <- c("Low BA" = "steelblue", "High BA" = "orange")
+
+# Create single combined plot
+combined_plot <- C.df %>%
+  ggplot(aes(x = var_type_label, y = estimate, color = ba_group_label)) +
+  geom_point(size = 3, position = position_dodge(width = 0.3)) +
+  geom_errorbar(aes(ymin = lower_ci, ymax = upper_ci), 
+                width = 0.2, position = position_dodge(width = 0.3)) +
+  geom_hline(yintercept = 0, linetype = "dashed", alpha = 0.5) +
+  scale_color_manual(values = ba_colors, name = "Basal Area Group") +
+  labs(x = "Weather Driver", 
+       y = "Standardized Coefficient Estimate") +
+  theme_minimal() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1),
+        legend.position = "bottom",
+        panel.grid.minor = element_blank()) +
+  guides(color = guide_legend(override.aes = list(size = 4)))
+
+# Display the plot
+combined_plot #The difference in magnitude is too high
+```
+
+
+
+The MARSS models demonstrate that binning by age group is not the best at explaining daily snow depth responses to weather drivers. If grouping into two bins, BA performs the best.
+
+Why is age such a good predictor for March snow depth and SDD, but not for daily snow depth?
+
+We demonstrated from the MLR analysis that there is variation in march snow depth and SDD, and age is a good indicator. Next- plot snow depth over time, categorized by age to see where the variation in later march snow depth comes from. Since the BA-constrained model was the best MARSS model, and TPH and percent shurb cover were important variables in the MLR analysis, let's do the graph for them as well.
+
+Unlike the MARSS models, sicne I'm jsut making graphs to look at the data visually, I don't need to wprry about parameter to observation ratio, so I'm going to bin each variable into 4 bins since that seems appropriate (based on jsut looking at the raw data). 
+Bin using k-means clustering
+```{r, eval = FALSE} 
+set.seed(123)  # reproducibility
+
+vars_to_bin <- c("age", "BA", "TPH", "per_shrub_cover")
+breaks_list <- list()
+
+for (v in vars_to_bin) {
+  x <- allvariables_TSA[[v]]
+  
+  # k-means clustering
+  km <- kmeans(x, centers = 4)
+  
+  # sort cluster centers
+  centers <- sort(km$centers)
+  
+  # compute midpoints between centers as breakpoints
+  breaks <- c(-Inf, head(centers, -1) + diff(centers)/2, Inf)
+  
+  # save results
+  breaks_list[[v]] <- breaks
+}
+
+breaks_list
+```
+Processing the snow depth data and categorizing the 25 time series plots by age group
+
+```{r, eval = FALSE} 
+# Step 1: Create a mapping between gap_ID and age from processed_data
+gap_age_mapping <- processed_data[, c(1,4)]
+
+ # Step 2: Prepare the snowdepth_TSA data for merging, reshape from wide to long format 
+snowdepth_long <- snowdepth_TSA %>%
+  pivot_longer(cols = -Date, 
+               names_to = "plot_name", 
+               values_to = "snow_depth") %>%
+
+  mutate(gap_ID = gsub("^C", "", plot_name))   # Remove the "C" prefix to match gap_ID format
+
+# Step 3: Merge with age information
+snowdepth_with_age <- snowdepth_long %>%
+  left_join(gap_age_mapping, by = "gap_ID") %>%
+  filter(!is.na(age)) # Remove rows where age is NA (plots not found in processed_data)
+
+# Step 4: Check which plots were successfully matched
+matched_plots <- snowdepth_with_age$plot_name %>% unique()
+unmatched_plots <- setdiff(names(snowdepth_TSA)[-1], matched_plots)  # Exclude Date column
+
+cat("Matched plots:", length(matched_plots), "\n") # Makes sense- we have 25 time-series to work with
+
+#Age bins from k-means clustering: -Inf 11.22500 23.43333 45.08333      Inf
+
+# Step 5: Use the same color scheme as the dot and whisker plots
+age_colors <- c("0 - 11" = "#440154", "12 - 24" = "#31688e", "25 - 45" = "#35b779", "46+" = "#fde725")
+
+# Create age groups from continuous age variable
+snowdepth_with_age_groups <- snowdepth_with_age %>%
+  mutate(
+    age_group = case_when(
+      age >= 0 & age <= 11 ~ "0 - 11",
+      age >= 11 & age <= 24 ~ "12 - 24", 
+      age >= 24 & age <= 45 ~ "25 - 45",
+      age >= 46 ~ "46+")) #There is only one site in this last category
+
+# Individual plot lines colored by age group
+snow_depth_plot <- snowdepth_with_age_groups %>%
+  ggplot(aes(x = Date, y = snow_depth, color = age_group)) +
+  geom_line(aes(group = plot_name), alpha = 0.7, size = 0.8) +
+  scale_color_manual(values = age_colors) +
+  labs(title = "Snow Depth Over Time by Age Group",
+       x = "Date",
+       y = "Snow Depth",
+       color = "Age Group") +
+  theme_minimal() +
+  theme(plot.title = element_text(hjust = 0.5, size = 14),
+        legend.position = "bottom")
+
+# Mean snow depth by age group with confidence bands  
+snow_depth_by_age_group_plot<- snowdepth_with_age_groups %>%
+  group_by(Date, age_group) %>%
+  summarise(
+    mean_snow = mean(snow_depth, na.rm = TRUE),
+    se_snow = sd(snow_depth, na.rm = TRUE) / sqrt(n()),
+    n_plots = n(),
+    .groups = "drop"
+  ) %>%
+  ggplot(aes(x = Date, y = mean_snow, color = age_group, fill = age_group)) +
+  geom_line(size = 1.2) +
+  #geom_ribbon(aes(ymin = mean_snow - se_snow, ymax = mean_snow + se_snow), 
+            #  alpha = 0.2, color = NA) +
+  scale_color_manual(values = age_colors) +
+  scale_fill_manual(values = age_colors) +
+  labs(title = "Mean Snow Depth Over Time by Age Group", tag="a)",
+       #subtitle = "Ribbons show ± 1 standard error",
+       x = "Date",
+       y = "Mean Snow Depth (cm)",
+       color = "Age (years)",
+       fill = "Age (years)") +
+  theme_minimal() +
+  theme(plot.title = element_text(hjust = 0.5, size = 13),
+        plot.subtitle = element_text(hjust = 0.5, size = 11),
+        legend.position = c(0.8,0.7))
+
+# Display both plots
+snow_depth_plot # Reserve for supplementary info
+snow_depth_by_age_group_plot
+  
+```
+Visually, it seems the rate of ablation seems to be similar (just looking at the slope of the time series), and it really seems like the variation in the late season might originate from more variability with the rate of accumulation.
+
+Processing the snow depth data and categorizing the 25 time series plots by basal area group
+```{r, eval = FALSE} 
+# Step 1: Create a mapping between gap_ID and basal area from processed_data
+gap_ba_mapping <- processed_data[, c(1,9)]
+names(gap_ba_mapping)[2] <- "basal_area"  # Rename for clarity
+
+ # Step 2: Prepare the snowdepth_TSA data for merging, reshape from wide to long format 
+snowdepth_long <- snowdepth_TSA %>%
+  pivot_longer(cols = -Date, 
+               names_to = "plot_name", 
+               values_to = "snow_depth") %>%
+
+  mutate(gap_ID = gsub("^C", "", plot_name))   # Remove the "C" prefix to match gap_ID format
+
+# Step 3: Merge with basal area information
+snowdepth_with_ba <- snowdepth_long %>%
+  left_join(gap_ba_mapping, by = "gap_ID") %>%
+  filter(!is.na(basal_area)) # Remove rows where basal_area is NA (plots not found in processed_data)
+
+# Step 4: Check which plots were successfully matched
+matched_plots <- snowdepth_with_ba$plot_name %>% unique()
+unmatched_plots <- setdiff(names(snowdepth_TSA)[-1], matched_plots)  # Exclude Date column
+cat("Matched plots:", length(matched_plots), "\n") # Should be 25 time-series
+
+#BA bins from k-means clustering: -Inf  8.952588 26.485917 54.035280       Inf
+
+#Step 5: Create basal area groups and color scheme
+ba_colors <- c("0 - 9" = "#440154", "10 - 27" = "#31688e", "28 - 54" = "#35b779", "55+" = "#fde725")
+
+# Create BA groups from continuous basal area variable
+snowdepth_with_ba_groups <- snowdepth_with_ba %>%
+  mutate(
+    ba_group = case_when(
+      basal_area >= 0 & basal_area <= 9 ~ "0 - 9",
+      basal_area >= 10 & basal_area <= 27 ~ "10 - 27", 
+      basal_area >= 28 & basal_area <= 54 ~ "28 - 54",
+      basal_area >= 55 ~ "55+"))
+
+
+# Individual plot lines colored by basal area group
+snow_depth_plot <- snowdepth_with_ba_groups %>%
+  ggplot(aes(x = Date, y = snow_depth, color = ba_group)) +
+  geom_line(aes(group = plot_name), alpha = 0.7, size = 0.8) +
+  scale_color_manual(values = ba_colors) +
+  labs(title = "Snow Depth Over Time by Basal Area Group",
+       x = "Date",
+       y = "Snow Depth",
+       color = "Basal Area Group") +
+  theme_minimal() +
+  theme(plot.title = element_text(hjust = 0.5, size = 14),
+        legend.position = "bottom")
+
+# Mean snow depth by basal area group with confidence bands  
+snow_depth_by_ba_group_plot <- snowdepth_with_ba_groups %>%
+  group_by(Date, ba_group) %>%
+  summarise(
+    mean_snow = mean(snow_depth, na.rm = TRUE),
+    se_snow = sd(snow_depth, na.rm = TRUE) / sqrt(n()),
+    n_plots = n(),
+    .groups = "drop"
+  ) %>%
+  ggplot(aes(x = Date, y = mean_snow, color = ba_group, fill = ba_group)) +
+  geom_line(size = 1.2) +
+  #geom_ribbon(aes(ymin = mean_snow - se_snow, ymax = mean_snow + se_snow), 
+              #alpha = 0.2, color = NA) +
+  scale_color_manual(values = ba_colors) +
+  scale_fill_manual(values = ba_colors) +
+  labs(title = "Mean Snow Depth Over Time by Basal Area Group", tag="b)",
+      # subtitle = "Ribbons show ± 1 standard error",
+       x = "Date",
+       y = "Mean Snow Depth (cm)",
+       color = "Basal Area (m²/ha)",
+       fill = "Basal Area (m²/ha)") +
+  theme_minimal() +
+  theme(plot.title = element_text(hjust = 0.5, size = 13),
+        plot.subtitle = element_text(hjust = 0.5, size = 11),
+        legend.position = c(0.8,0.7))
+
+# Display both plots
+snow_depth_plot # Reserve for supplementary info
+snow_depth_by_ba_group_plot
+```
+Processing the snow depth data and categorizing the 25 time series plots by TPH group
+```{r, eval = FALSE} 
+# Step 1: Create a mapping between gap_ID and TPH from processed_data
+gap_TPH_mapping <- processed_data[, c(1,6)]
+names(gap_TPH_mapping)[2] <- "TPH"  # Rename for clarity
+
+ # Step 2: Prepare the snowdepth_TSA data for merging, reshape from wide to long format 
+snowdepth_long <- snowdepth_TSA %>%
+  pivot_longer(cols = -Date, 
+               names_to = "plot_name", 
+               values_to = "snow_depth") %>%
+
+  mutate(gap_ID = gsub("^C", "", plot_name))   # Remove the "C" prefix to match gap_ID format
+
+# Step 3: Merge with TPH information
+snowdepth_with_TPH <- snowdepth_long %>%
+  left_join(gap_TPH_mapping, by = "gap_ID") %>%
+  filter(!is.na(TPH)) # Remove rows where TPH is NA (plots not found in processed_data)
+
+# Step 4: Check which plots were successfully matched
+matched_plots <- snowdepth_with_TPH$plot_name %>% unique()
+unmatched_plots <- setdiff(names(snowdepth_TSA)[-1], matched_plots)  # Exclude Date column
+cat("Matched plots:", length(matched_plots), "\n") # Should be 25 time-series
+
+#TPH bins from k-means clustering: -Inf  711.0152 2132.3102 4327.4263       Inf
+#the bins are exactly the same as breaks, but it still captures the same groupings but with simpler numbers
+
+#Step 5: Create TPH groups and color scheme
+TPH_colors <- c("0 - 750" = "#440154", "751 - 2000" = "#31688e", "2001 - 4000" = "#35b779", "4001+" = "#fde725")
+
+# Create TPH groups from continuous TPH variable
+snowdepth_with_TPH_groups <- snowdepth_with_TPH %>%
+  mutate(
+    TPH_group = case_when(
+      TPH >= 0 & TPH < 750 ~ "0 - 750",
+      TPH >= 750 & TPH <= 2000 ~ "751 - 2000",
+      TPH >= 2001 & TPH <= 4000 ~ "2001 - 4000",
+      TPH > 4001 ~ "4001+"
+    ) ,
+    TPH_group = factor(TPH_group, levels = c("0 - 750", "751 - 2000", "2001 - 4000", "4001+"))
+
+    )
+
+
+# Individual plot lines colored by TPH group
+snow_depth_plot <- snowdepth_with_TPH_groups %>%
+  ggplot(aes(x = Date, y = snow_depth, color = TPH_group)) +
+  geom_line(aes(group = plot_name), alpha = 0.7, size = 0.8) +
+  scale_color_manual(values = TPH_colors) +
+  labs(title = "Snow Depth Over Time by TPH Group",
+       x = "Date",
+       y = "Snow Depth",
+       color = "TPH Group") +
+  theme_minimal() +
+  theme(plot.title = element_text(hjust = 0.5, size = 14),
+        legend.position = c(0.9,0.8))
+
+# Mean snow depth by TPH group with confidence bands  
+snow_depth_by_TPH_group_plot <- snowdepth_with_TPH_groups %>%
+  group_by(Date, TPH_group) %>%
+  summarise(
+    mean_snow = mean(snow_depth, na.rm = TRUE),
+    se_snow = sd(snow_depth, na.rm = TRUE) / sqrt(n()),
+    n_plots = n(),
+    .groups = "drop"
+  ) %>%
+  ggplot(aes(x = Date, y = mean_snow, color = TPH_group, fill = TPH_group)) +
+  geom_line(size = 1.2) +
+  #geom_ribbon(aes(ymin = mean_snow - se_snow, ymax = mean_snow + se_snow), 
+             # alpha = 0.2, color = NA) +
+  scale_color_manual(values = TPH_colors) +
+  scale_fill_manual(values = TPH_colors) +
+  labs(title = "Mean Snow Depth Over Time by TPH Group", tag="c)",
+      # subtitle = "Ribbons show ± 1 standard error",
+       x = "Date",
+       y = "Mean Snow Depth (cm)",
+       color = "Trees per hectare",
+       fill = "Trees per hectare") +
+  theme_minimal() +
+  theme(plot.title = element_text(hjust = 0.5, size = 13),
+        plot.subtitle = element_text(hjust = 0.5, size = 11),
+        legend.position = c(0.8,0.7))
+
+# Display both plots
+snow_depth_plot # Reserve for supplementary info
+snow_depth_by_TPH_group_plot
+```
+Processing the snow depth data and categorizing the 25 time series plots by Shrub Cover group
+```{r, eval = FALSE} 
+# Step 1: Create a mapping between gap_ID and per_shrub_cover from processed_data
+gap_shrubcover_mapping <- processed_data[, c(1,8)]
+names(gap_shrubcover_mapping)[2] <- "shrubcover"  # Rename for clarity
+
+ # Step 2: Prepare the snowdepth_TSA data for merging, reshape from wide to long format 
+snowdepth_long <- snowdepth_TSA %>%
+  pivot_longer(cols = -Date, 
+               names_to = "plot_name", 
+               values_to = "snow_depth") %>%
+
+  mutate(gap_ID = gsub("^C", "", plot_name))   # Remove the "C" prefix to match gap_ID format
+
+# Step 3: Merge with shurb cover information
+snowdepth_with_shrubcover <- snowdepth_long %>%
+  left_join(gap_shrubcover_mapping, by = "gap_ID") %>%
+  filter(!is.na(shrubcover)) # Remove rows where shrubcover is NA (plots not found in processed_data)
+
+# Step 4: Check which plots were successfully matched
+matched_plots <- snowdepth_with_shrubcover$plot_name %>% unique()
+unmatched_plots <- setdiff(names(snowdepth_TSA)[-1], matched_plots)  # Exclude Date column
+cat("Matched plots:", length(matched_plots), "\n") # Should be 25 time-series
+
+#shrub cover bins from k-means clustering: -Inf  6.216667 17.416667 35.000000       Inf
+#the bins are exactly the same as breaks, but it still captures the same groupings but with simpler numbers
+
+#Step 5: Create shrub cover groups and color scheme
+shrubcover_colors <- c("0 - 5" = "#440154", "6 - 18" = "#31688e", "19 - 35" = "#35b779", "36+" = "#fde725")
+
+# Create TPH groups from continuous TPH variable
+snowdepth_with_shrubcover_groups <- snowdepth_with_shrubcover %>%
+  mutate(
+    shrubcover_group = case_when(
+      shrubcover >= 0 & shrubcover <= 5 ~ "0 - 5",
+      shrubcover >= 6 & shrubcover <= 18 ~ "6 - 18",
+      shrubcover >= 19 & shrubcover <= 35 ~ "19 - 35",
+      shrubcover > 35 ~ "36+"
+    ) ,
+    shrubcover_group = factor(shrubcover_group, levels = c("0 - 5", "6 - 18", "19 - 35", "36+"))
+    )
+
+
+# Individual plot lines colored by TPH group
+snow_depth_plot <- snowdepth_with_shrubcover_groups %>%
+  ggplot(aes(x = Date, y = snow_depth, color = shrubcover_group)) +
+  geom_line(aes(group = plot_name), alpha = 0.7, size = 0.8) +
+  scale_color_manual(values = shrubcover_colors) +
+  labs(title = "Snow Depth Over Time by Shrub Cover Group", tag="d)",
+       x = "Date",
+       y = "Snow Depth",
+       color = "Shrub Cover Group") +
+  theme_minimal() +
+  theme(plot.title = element_text(hjust = 0.5, size = 14),
+        legend.position = c(0.9,0.8))
+
+# Mean snow depth by shrub cover group with confidence bands  
+snow_depth_by_shrubcover_group_plot <- snowdepth_with_shrubcover_groups %>%
+  group_by(Date, shrubcover_group) %>%
+  summarise(
+    mean_snow = mean(snow_depth, na.rm = TRUE),
+    se_snow = sd(snow_depth, na.rm = TRUE) / sqrt(n()),
+    n_plots = n(),
+    .groups = "drop"
+  ) %>%
+  ggplot(aes(x = Date, y = mean_snow, color = shrubcover_group, fill = shrubcover_group)) +
+  geom_line(size = 1.2) +
+  #geom_ribbon(aes(ymin = mean_snow - se_snow, ymax = mean_snow + se_snow), 
+             # alpha = 0.2, color = NA) +
+  scale_color_manual(values = shrubcover_colors) +
+  scale_fill_manual(values = shrubcover_colors) +
+  labs(title = "Mean Snow Depth Over Time by Shrub Cover Group",tag="d)",
+      # subtitle = "Ribbons show ± 1 standard error",
+       x = "Date",
+       y = "Mean Snow Depth (cm)",
+       color = "Shrub Cover (%)",
+       fill = "Shrub Cover") +
+  theme_minimal() +
+  theme(plot.title = element_text(hjust = 0.5, size = 13),
+        plot.subtitle = element_text(hjust = 0.5, size = 11),
+        legend.position = c(0.8,0.7))
+
+# Display both plots
+#snow_depth_plot # Reserve for supplementary info
+snow_depth_by_shrubcover_group_plot
+```
+
+
+```{r my-plots, eval = FALSE, fig.width=10, fig.height=8}
+grid.arrange(snow_depth_by_age_group_plot, snow_depth_by_ba_group_plot, snow_depth_by_TPH_group_plot, snow_depth_by_shrubcover_group_plot, ncol = 2)
+```
+Overall, we see a pretty clear apttern where older canopy gaps have less snow depth consistently, there is a less straightforward relationship between BA and daily snow depth. It looks like 10-27 m^2/ha BA group consistenyl had the highest daily snow depth. With TPH it seems like msot of the TPH groups except for 4000+ TPH had similar daily snow depth patterns. The two sites that had > 4000 TPH were sites that were 13 and 16 years old, so these canopy gaps were full of small trees. It seems like the some level of shrub cover is beneficial for snow retention, at least in the second half of the season (since we're dealing with some incomplete data).
+
+
+HYPOTHESIS 3: Trying to seperate the accumulation and ablation periods to see how vegetation and/or age impact snowpack
+
+Use Multiple Linear Regression to examine the predictors of snow accumulation and ablation
+
+1. Calculate the snow accumulation rates during storm events
+```{r}
+snowdepth_TSA$Date <- as.Date(snowdepth_TSA$Date) # Make sure Date column is in Date format
+
+# Define storm periods
+storm1_start <- as.Date("2021-01-21")  # Day before storm
+storm1_end <- as.Date("2021-01-22")    # Storm day
+
+storm2_start <- as.Date("2021-01-24")  # Day before storm
+storm2_end <- as.Date("2021-01-25")    # Storm day
+
+storm3_start <- as.Date("2021-01-26")  # Day before storm
+storm3_end <- as.Date("2021-01-29")    # Last day of storm
+
+storm4_start <- as.Date("2021-02-19")  # Day before storm
+storm4_end <- as.Date("2021-02-20")    # Last day of storm
+
+storm5_start <- as.Date("2021-03-08")  # Day before storm  
+storm5_end <- as.Date("2021-03-11")    # Last day of storm
+
+storm6_start <- as.Date("2021-03-14")  # Day before storm
+storm6_end <- as.Date("2021-03-15")    # Storm day
+
+# Calculate accumulation rate for a single storm
+calculate_accumulation_rate <- function(data, start_date, end_date, gap_ids) {
+  
+ # Get snow depths at start and end of storm
+  start_depths <- data[data$Date == start_date, gap_ids, drop = FALSE]
+  end_depths <- data[data$Date == end_date, gap_ids, drop = FALSE]
+  
+  # Calculate duration (days)
+  duration <- as.numeric(end_date - start_date)
+  
+  # Calculate accumulation (end - start)
+  accumulation <- end_depths - start_depths
+  
+  # Calculate rate (accumulation / duration)
+  rate <- accumulation / duration
+  
+  return(rate)
+}
+
+# Get gap_ID column names (all columns except Date)
+gap_ids <- names(snowdepth_TSA)[names(snowdepth_TSA) != "Date"]
+
+# Calculate accumulation rates for each storm
+accum1_rates <- calculate_accumulation_rate(snowdepth_TSA, storm1_start, storm1_end, gap_ids)
+accum2_rates <- calculate_accumulation_rate(snowdepth_TSA, storm2_start, storm2_end, gap_ids)
+accum3_rates <- calculate_accumulation_rate(snowdepth_TSA, storm3_start, storm3_end, gap_ids)
+accum4_rates <- calculate_accumulation_rate(snowdepth_TSA, storm4_start, storm4_end, gap_ids)
+accum5_rates <- calculate_accumulation_rate(snowdepth_TSA, storm5_start, storm5_end, gap_ids)
+accum6_rates <- calculate_accumulation_rate(snowdepth_TSA, storm6_start, storm6_end, gap_ids)
+
+accumulation_data <- data.frame(
+  gap_ID = gap_ids,
+  accum1 = as.numeric(accum1_rates[1, ]),
+  accum2 = as.numeric(accum2_rates[1, ]),
+  accum3 = as.numeric(accum3_rates[1, ]),
+  accum4 = as.numeric(accum4_rates[1, ]),
+  accum5 = as.numeric(accum5_rates[1, ]),
+  accum6 = as.numeric(accum6_rates[1, ])
+)
+
+accumulation_data$gap_ID <- gsub("^C", "", accumulation_data$gap_ID) # Remove "C" prefix from gap_ID to match processed_data format
+
+summary(accumulation_data)
+
+# Note: During storm events some cameras were covered in snow, or blocked by branches that were weighted with snow, and resulting in no data. No data was more likely to occur during the larger storms. I already have very few sites (25), so I want to take out the storms that have too many NAs, as I won't have many data points to work with. For that reason, I'm not going to include accum3 in the next step.
+```
+Because my initial sample size is so small (while I had 30 total sites, only 25 had working time lapse cameras, and even few had cameras that worked through every single storm), I need to be careful to not over-fit my model.
+
+2. Finding the best models for Accumulation
+```{r}
+# Merge with processed_data
+processed_data <- processed_data %>%
+  left_join(accumulation_data, by = "gap_ID") #Don't do this more than once or the column names will be different and the following code won't work
+
+view(processed_data) # check to see if the merge went well- it did.
+
+# Initialize the list BEFORE the loop
+accum_subset_results <- list()
+
+accum_vars <- c("accum1", "accum2","accum3","accum4","accum5","accum6")
+
+for (var in accum_vars) {
+  
+  # Build formula
+  model_formula <- as.formula(
+    paste0(var, " ~ age + slope + size + BA + TPH + avg_shrub_ht + per_shrub_cover + neighbor_ht + northness + eastness + small_tree_ratio")
+  )
+  
+  # Fit model
+  model <- lm(model_formula, data = processed_data)
+  
+  # Best subset selection
+  best_subsets <- ols_step_best_subset(model)
+  
+  # Store the result
+  accum_subset_results[[var]] <- best_subsets
+}
+
+###############################################################################
+
+#View Adj R-square, predicted R-square, and AIC for accum1
+accum_subset_results$accum1 
+
+#Calculate AICc for accum1
+accum1_AIC <-c(106.4541,103.4226,102.9373,101.3407,98.0657,97.3811,99.0250,100.8784,102.8250,104.7599,106.7395)
+accum1_k<-c(1,2,3,4,5,6,7,8,9,10,11)
+n<-20
+# Initialize vector to store AICc values
+accum1_AICc <- numeric(length(accum1_AIC))
+
+for (i in 1:length(accum1_AIC)) {
+  k <- accum1_k[i]
+  AIC <- accum1_AIC[i]
+  
+  # Calculate AICc using the formula: AICc = AIC + 2k(k+1)/(n-k-1)
+  correction <- (2 * k * (k + 1)) / (n - k - 1)
+  accum1_AICc[i] <- AIC + correction
+  
+}
+accum1_AICc #Model 5 has the lowest AIcc score 
+# slope, BA, per_shrub_cover, neighbor_ht, northness
+
+########################################################################
+
+#View Adj R-square, predicted R-square, and AIC for accum2
+accum_subset_results$accum2 
+#Calculate AICc for accum2
+accum2_AIC <-c(100.2770,99.5909,99.2591,98.9114,97.8887,94.0123,94.2273,94.1636,95.2751,97.2265,99.2250)
+accum1_k<-c(1,2,3,4,5,6,7,8,9,10,11)
+n<-16
+# Initialize vector to store AICc values
+accum2_AICc <- numeric(length(accum2_AIC))
+
+for (i in 1:length(accum2_AIC)) {
+  k <- accum1_k[i]
+  AIC <- accum2_AIC[i]
+  
+  # Calculate AICc using the formula: AICc = AIC + 2k(k+1)/(n-k-1)
+  correction <- (2 * k * (k + 1)) / (n - k - 1)
+  accum2_AICc[i] <- AIC + correction
+  
+}
+accum2_AICc #Model 2 has the lowest AICc score, but Model 1 is only 0.0487 higher--> go with the simpler model
+# age 
+
+########################################################################
+
+#View Adj R-square, predicted R-square, and AIC for accum3
+accum_subset_results$accum3 # C(p) is NaN for all models, so this one might have to be thrown out
+#Calculate AICc for accum3
+accum3_AIC <-c(86.6592,86.8374,83.5170,81.2742,78.8911,61.9970,43.0441,34.9204,29.4237,14.4271,-Inf)
+accum1_k<-c(1,2,3,4,5,6,7,8,9,10,11)
+n<-13
+# Initialize vector to store AICc values
+accum3_AICc <- numeric(length(accum3_AIC))
+
+for (i in 1:length(accum3_AIC)) {
+  k <- accum1_k[i]
+  AIC <- accum3_AIC[i]
+  
+  # Calculate AICc using the formula: AICc = AIC + 2k(k+1)/(n-k-1)
+  correction <- (2 * k * (k + 1)) / (n - k - 1)
+  accum3_AICc[i] <- AIC + correction
+  
+}
+accum3_AICc 
+#Don't trust the AICc coming from accum3 --> discard this sample
+
+########################################################################
+
+#View Adj R-square, predicted R-square, and AIC for accum4
+accum_subset_results$accum4 
+#Calculate AICc for accum4
+accum4_AIC <-c(96.0206,93.6637,90.6491,89.6061,90.6449,92.1821,93.7845,95.5300,97.3533,99.3010,101.2849)
+accum1_k<-c(1,2,3,4,5,6,7,8,9,10,11)
+n<-23
+# Initialize vector to store AICc values
+accum4_AICc <- numeric(length(accum4_AIC))
+
+for (i in 1:length(accum4_AIC)) {
+  k <- accum1_k[i]
+  AIC <- accum4_AIC[i]
+  
+  # Calculate AICc using the formula: AICc = AIC + 2k(k+1)/(n-k-1)
+  correction <- (2 * k * (k + 1)) / (n - k - 1)
+  accum4_AICc[i] <- AIC + correction
+  
+}
+accum4_AICc #Model 4 has the lowest AICc score, but Model 3's AICc score is only 0.084 higher. This difference is practically negligible, so we'll go with the simpler model for parimony and because n =23
+# age, slope, small_tree_ratio
+
+########################################################################
+
+#View Adj R-square, predicted R-square, and AIC for accum5
+accum_subset_results$accum5
+#Calculate AICc for accum5
+accum5_AIC <-c(78.6111,75.7070,73.4397,72.6540,72.0943,73.2412,74.5295,76.4327,78.2164,80.1824,82.1755)
+accum1_k<-c(1,2,3,4,5,6,7,8,9,10,11)
+n<-23
+# Initialize vector to store AICc values
+accum5_AICc <- numeric(length(accum5_AIC))
+
+for (i in 1:length(accum5_AIC)) {
+  k <- accum1_k[i]
+  AIC <- accum5_AIC[i]
+  
+  # Calculate AICc using the formula: AICc = AIC + 2k(k+1)/(n-k-1)
+  correction <- (2 * k * (k + 1)) / (n - k - 1)
+  accum5_AICc[i] <- AIC + correction
+  
+}
+accum5_AICc #Model 3 has the lowest AICc score
+# age,northness, eastness
+
+########################################################################
+
+#View Adj R-square, predicted R-square, and AIC for accum6
+accum_subset_results$accum6
+#Calculate AICc for accum6
+accum6_AIC <-c(109.6901,107.6440,105.7091,103.6209,93.9231,93.4171,94.1810,94.9637,95.5204,97.0773,99.0641)
+accum1_k<-c(1,2,3,4,5,6,7,8,9,10,11)
+n<-21
+# Initialize vector to store AICc values
+accum6_AICc <- numeric(length(accum6_AIC))
+
+for (i in 1:length(accum6_AIC)) {
+  k <- accum1_k[i]
+  AIC <- accum6_AIC[i]
+  
+  # Calculate AICc using the formula: AICc = AIC + 2k(k+1)/(n-k-1)
+  correction <- (2 * k * (k + 1)) / (n - k - 1)
+  accum6_AICc[i] <- AIC + correction
+  
+}
+accum6_AICc #Model 5 has the lowest AICc score 
+# age,size_ac, TPH_Total, avg_shrub_ht, per_shurb_cover
+
+################################################################
+
+#Summary of the best models
+
+accum1_best <- lm(accum1~slope+BA+per_shrub_cover+neighbor_ht+northness, data = processed_data)
+accum2_best <- lm(accum2~age, data = processed_data)
+accum4_best <- lm(accum4~age+slope+small_tree_ratio, data = processed_data)
+accum5_best <- lm(accum5~age+northness+eastness, data = processed_data)
+accum6_best <- lm(accum6~age+size+TPH+avg_shrub_ht+per_shrub_cover, data = processed_data)
+
+summary(accum1_best) 
+#p-value: 0.09341; BA_H is the only statisticaly significant variable
+
+summary(accum2_best)
+#p-value: 0.002053; age is a statistically significant variable
+
+summary(accum4_best)
+#p-value: 0.002397; age, slope, and small_tree_ratio are all statistically significant
+
+summary(accum5_best)
+#p-value: 5.571e-05; age and eastness are statistically significant
+
+summary(accum6_best)
+#p-value: 0.02612; age is the only statistically significant variable
+```
+Overall, we see a trend of age being included in these "best" models for predicting snow accumulation. Age wasn't included as a predictor in accum1, but that model was barely statistically signifciant (p-value <0.1), and also it was the first storm of the year, so probably not indicative of the average storm.
+
+3. Calculate the snow ablation rates for each of the three distinct periods
+```{r}
+# Define ablation periods
+ablate1_start <- as.Date("2021-01-31")  # Day after storm - has slightly more data completeness than day the storm ended
+ablate1_end <- as.Date("2021-02-19")    # Day before next precip event
+#This period is straightforward
+
+ablate2_start <- as.Date("2021-02-20")  # Small storm event
+ablate2_end <- as.Date("2021-03-08")    # Day before next storm or plot reaches 0cm snow depth
+#Calculating ablation rates for this period is trickier because some sites reach 0cm very quickly- So for some of the sites that never had that much snow to begin with , the ablation period is actually from 2021-02-20 to when the site reaches 0 cm snow depth.
+
+ablate3_start <- as.Date("2021-03-11")  # Last day of storm
+ablate3_end <- as.Date("2021-03-14")    # Day before next storm.
+# This period is rather short, but temps were warm these few days so there is reason to believe this is more ablation than just snow settling. Straightforward since no plots reached 0cm
+
+ablate4_start <- as.Date("2021-03-16")  # Day after last storm event, has slightly more data
+ablate4_end <- as.Date("2021-04-03")    # When the plot reaches 0 cm snow depth, same as ablate2
+
+
+# Calculate accumulation rate for the straightforward ablation periods (ablation rate is often reported as the absolute value of the slope)
+calculate_ablation_rate <- function(data, start_date, end_date, gap_ids) {
+  
+ # Get snow depths at start and end of ablation period
+  start_depths <- data[data$Date == start_date, gap_ids, drop = FALSE]
+  end_depths <- data[data$Date == end_date, gap_ids, drop = FALSE]
+  
+  # Calculate duration (days)
+  duration <- as.numeric(end_date - start_date)
+  
+  # Calculate ablation (start - end)
+  ablation <- start_depths - end_depths
+  
+  # Calculate rate (ablation / duration)
+  rate <- ablation / duration
+  
+  return(rate)
+}
+
+# Get gap_ID column names (all columns except Date)
+gap_ids <- names(snowdepth_TSA)[names(snowdepth_TSA) != "Date"]
+
+# Calculate accumulation rates for each storm
+ablat1_rates <- calculate_ablation_rate(snowdepth_TSA, ablate1_start, ablate1_end, gap_ids)
+ablat3_rates <- calculate_ablation_rate(snowdepth_TSA, ablate3_start, ablate3_end, gap_ids)
+
+ablation_data <- data.frame(
+  gap_ID = gap_ids,
+  ablat1 = as.numeric(ablat1_rates[1, ]),
+  ablat3 = as.numeric(ablat3_rates[1, ])
+)
+
+ablation_data$gap_ID <- gsub("^C", "", ablation_data$gap_ID) # Remove "C" prefix from gap_ID to match processed_data format
+
+summary(ablation_data)
+
+################################################################################
+
+#Calculate ablation rates for the more complex periods (2, 4)
+
+snowdepth_TSA$Date <- as.Date(snowdepth_TSA$Date)
+
+# Function to calculate ablation rates for a given period
+calculate_ablation_rates <- function(df, start_date, end_date) {
+  # Subset to date range
+  subset_df <- df[df$Date >= start_date & df$Date <= end_date, ]
+  
+  # Initialize output
+  ablation_rates <- numeric(ncol(subset_df) - 1)
+  names(ablation_rates) <- colnames(subset_df)[-1]
+  
+  # Loop through each site
+  for (site in colnames(subset_df)[-1]) {
+    site_data <- subset_df[, c("Date", site)]
+    
+    # Get start depth
+    start_depth <- site_data[site_data$Date == start_date, 2]
+    
+    # If missing start value, skip
+    if (length(start_depth) == 0 || is.na(start_depth)) {
+      ablation_rates[site] <- NA
+      next
+    }
+    
+    # Find first date where snow hits 0 after start
+    zero_dates <- site_data$Date[site_data[, 2] == 0]
+    zero_dates <- zero_dates[zero_dates > start_date]
+    
+    if (length(zero_dates) > 0) {
+      date_zero <- min(zero_dates)
+      days_until_zero <- as.numeric(date_zero - start_date)
+      ablation_rate <- start_depth / days_until_zero
+    } else {
+      # Use end depth if no 0 found
+      end_depth <- site_data[site_data$Date == end_date, 2]
+      
+      if (length(end_depth) == 0 || is.na(end_depth)) {
+        ablation_rate <- NA
+      } else {
+        ablation_rate <- (start_depth - end_depth) / as.numeric(end_date - start_date)
+      }
+    }
+    
+    ablation_rates[site] <- ablation_rate
+  }
+  
+  return(ablation_rates)
+}
+
+
+# --- Apply the function to both time periods ---
+ablation_rates_2 <- calculate_ablation_rates(snowdepth_TSA, ablate2_start, ablate2_end)
+ablation_rates_4 <- calculate_ablation_rates(snowdepth_TSA, ablate4_start, ablate4_end)
+
+ablation_rates_2 #checking manually that it works -yep
+ablation_rates_4 #woohoo!!!!! it works
+
+#Time to change the format so ablation rates for periods 2 and 4 can be added to ablation_data
+# Convert list to named vector
+ablation_rates_2_vec <- unlist(ablation_rates_2)
+ablation_data$ablat2 <- ablation_rates_2_vec
+
+ablation_rates_4_vec <- unlist(ablation_rates_4)
+ablation_data$ablat4 <- ablation_rates_4_vec
+
+summary(ablation_data) #it works
+
+
+# Merge with processed_data
+processed_data <- processed_data %>%
+  left_join(ablation_data, by = "gap_ID")
+
+view(processed_data) # check to see if the merge went well- it did.
+```
+
+Finding the "best" models for ablation
+```{r}
+ablat_vars <- c("ablat1", "ablat2","ablat3","ablat4")
+ablat_subset_results <- list()
+
+
+for (var in ablat_vars) {
+  
+  # Build formula
+  model_formula <- as.formula(
+    paste0(var, " ~ age + slope + size + BA + TPH + avg_shrub_ht + per_shrub_cover + neighbor_ht + northness + eastness + small_tree_ratio")
+  )
+  
+  # Fit model
+  model <- lm(model_formula, data = processed_data)
+  
+  # Best subset selection
+  best_subsets <- ols_step_best_subset(model)
+  
+  # Store the result
+  ablat_subset_results[[var]] <- best_subsets
+}
+
+###############################################################################
+
+#View Adj R-square, predicted R-square, and AIC for ablat1
+ablat_subset_results$ablat1 #Initially looks like Model 7 is best but...
+
+#Calculate AICc for ablat1
+ablat1_AIC <-c(50.7553,48.5674,48.3238,44.6866,42.0630,38.0165,34.1844,35.2305,35.7167,36.6654,38.6482)
+accum1_k<-c(1,2,3,4,5,6,7,8,9,10,11)
+n<-19
+# Initialize vector to store AICc values
+ablat1_AICc <- numeric(length(ablat1_AIC))
+
+for (i in 1:length(ablat1_AIC)) {
+  k <- accum1_k[i]
+  AIC <- ablat1_AIC[i]
+  
+  # Calculate AICc using the formula: AICc = AIC + 2k(k+1)/(n-k-1)
+  correction <- (2 * k * (k + 1)) / (n - k - 1)
+  ablat1_AICc[i] <- AIC + correction
+  
+}
+ablat1_AICc #Model 7 has the lowest AIcc score, but Model 6 is only 0.65028 points higher, so go with the simpler model
+# age, slope, size, northness, eastness, small_tree_ratio Still pretty high number of parameters for observation =19
+
+###############################################################################
+
+#View Adj R-square, predicted R-square, and AIC for ablat2
+ablat_subset_results$ablat2 #Initially looks like Model 5 is best but...
+
+#Calculate AICc for ablat2
+ablat2_AIC <-c(30.6175,25.0754,22.4006,21.9296,21.1330,21.6277,21.9481,22.8819,24.0068,25.2136,27.1084)
+accum1_k<-c(1,2,3,4,5,6,7,8,9,10,11)
+n<-22
+# Initialize vector to store AICc values
+ablat2_AICc <- numeric(length(ablat2_AIC))
+
+for (i in 1:length(ablat2_AIC)) {
+  k <- accum1_k[i]
+  AIC <- ablat2_AIC[i]
+  
+  # Calculate AICc using the formula: AICc = AIC + 2k(k+1)/(n-k-1)
+  correction <- (2 * k * (k + 1)) / (n - k - 1)
+  ablat2_AICc[i] <- AIC + correction
+  
+}
+ablat2_AICc #Model 3 has the lowest AIcc score
+# age, slope, small_tree_ratio
+
+###############################################################################
+
+#View Adj R-square, predicted R-square, and AIC for ablat3
+ablat_subset_results$ablat3 #Initially looks like Model 5 is best but...
+
+#Calculate AICc for ablat3
+ablat3_AIC <-c(85.1900,75.3658,75.7634,75.3428,74.9766,75.9174,76.4025,76.8627,78.2926,80.2430,82.2265)
+accum1_k<-c(1,2,3,4,5,6,7,8,9,10,11)
+n<-23
+# Initialize vector to store AICc values
+ablat3_AICc <- numeric(length(ablat3_AIC))
+
+for (i in 1:length(ablat3_AIC)) {
+  k <- accum1_k[i]
+  AIC <- ablat3_AIC[i]
+  
+  # Calculate AICc using the formula: AICc = AIC + 2k(k+1)/(n-k-1)
+  correction <- (2 * k * (k + 1)) / (n - k - 1)
+  ablat3_AICc[i] <- AIC + correction
+  
+}
+ablat3_AICc #Model 2 has the lowest AIcc score
+# age, small_tree_ratio
+
+###############################################################################
+
+#View Adj R-square, predicted R-square, and AIC for ablat4
+ablat_subset_results$ablat4 #Note- all the models except for Model 3 has a negative predicted R-square, raising some red flags
+
+#Calculate AICc for ablat4
+ablat4_AIC <-c(47.1617,45.8578,43.8042,45.1829,46.6366,47.9782,49.4963,50.9135,52.7054,54.4235,56.3892)
+accum1_k<-c(1,2,3,4,5,6,7,8,9,10,11)
+n<-19
+# Initialize vector to store AICc values
+ablat4_AICc <- numeric(length(ablat4_AIC))
+
+for (i in 1:length(ablat4_AIC)) {
+  k <- accum1_k[i]
+  AIC <- ablat4_AIC[i]
+  
+  # Calculate AICc using the formula: AICc = AIC + 2k(k+1)/(n-k-1)
+  correction <- (2 * k * (k + 1)) / (n - k - 1)
+  ablat4_AICc[i] <- AIC + correction
+  
+}
+ablat4_AICc #Model 3 has the lowest AICc score- Model 2's AICc score is 1.2036 greater, but it also had a negative Predicted R-squared so we're sticking with Model 3
+#avg_shrub_ht, per_shrub_cover, neighbor_ht
+
+################################################################
+
+#Summary of the best models
+
+ablat1_best <- lm(ablat1~age+slope+size+northness+eastness+small_tree_ratio, data = processed_data)
+ablat2_best <- lm(ablat2~age+slope+small_tree_ratio, data = processed_data)
+ablat3_best <- lm(ablat3~age+small_tree_ratio, data = processed_data)
+ablat4_best <- lm(ablat4~avg_shrub_ht+per_shrub_cover+neighbor_ht, data = processed_data)
+
+
+summary(ablat1_best) 
+#p-value: 0.003409, age, slope, northness, small_tree_ration are statistically significant
+
+summary(ablat2_best)
+#p-value: 4.114e-05; age and small tree ratio are statistically significant
+
+summary(ablat3_best)
+#p-value:  0.0001588; age and small_tree_ratio are statistically significant
+
+summary(ablat4_best)
+#p-value: 0.2685; none of the predictors are statistically significant 
+```
+
+3 out of the 4 ablation linear models have age as a predictor. Notably, the ablation period for the end of season doesn't have a great model, despite going through the ols subset process.
+
+
+This sensitivity analysis tests whether assigning ages of 50, 60, 70, 80 years to the two control sites (220_ and 400_) OR removing the control sites meaningfully changes the outcomes of:
+Claude (Anthropic) was a huge help in this section of the code.
+
+- **Part 1**: MLR models for ln(March snow depth) and Snow Disappearance Date (SDD)
+- **Part 3**: MLR models for snow accumulation and ablation rates
+
+The MARSS models (Part 2) are extremely computationally expensive (hours to days per run),
+so they are NOT looped here. Instead, a separate section at the end flags which MARSS
+results to re-examine if Part 1 or Part 3 show sensitivity to the age assumption.
+
+---
+Everything below this line is for the sensitivity analysis. I originally set the canopy gap age for my control units (220_ and 400_) as 60 since it's withing the range of the 50-80 year roation age typical of this ecosystem. Reviewers questioned the choice of 60 years understandably, so I am rerunning the MLR analyses with the control site "ages" as 50, 70, 80, and with the control sites taken out completely.
+## Setup: Load packages and base data
+
+```{r setup_sensitivity, message=FALSE, warning=FALSE}
+library(tidyverse)
+library(broom)
+library(readxl)
+library(olsrr)
+library(car)
+library(lmtest)
+library(AICcmodavg)
+library(dplyr)
+library(ggplot2)
+library(tidyr)
+library(gridExtra)
+library(stringr)
+
+# Load raw data
+raw_data <- read_excel("raw_data.xlsx")
+
+# Control site IDs to modify
+CONTROL_SITES <- c("220_", "400_")
+
+# Ages to test in the sensitivity analysis
+SENSITIVITY_AGES <- c(50, 60, 70, 80, NA)
+```
+
+---
+
+## Helper functions
+
+`process_raw_data()` handles both scenarios:
+- When `control_age` is a number (50/60/70/80): reassigns that age to the control sites
+- When `control_age` is `NA`: removes the control sites entirely before processing
+
+```{r process_function}
+process_raw_data <- function(raw_data, control_age) {
+  
+  d <- raw_data  # copy so we don't modify the original
+  
+  if (is.na(control_age)) {
+    # --- REMOVE control sites entirely ---
+    d <- d[!d$gap_ID %in% CONTROL_SITES, ]
+  } else {
+    # --- Reassign control site age ---
+    d$age[d$gap_ID %in% CONTROL_SITES] <- control_age
+  }
+  
+  # --- All original transformations from Part 1 ---
+  d$aspect_rad       <- d$aspect_deg * pi / 180
+  d$SDD_n            <- as.numeric(strftime(d$SDD, format = "%j"))
+  d$aspect_cos       <- cos(d$aspect_rad)
+  d$aspect_sin       <- sin(d$aspect_rad)
+  d$northness        <- sin(d$slope) * d$aspect_cos
+  d$eastness         <- sin(d$slope) * d$aspect_sin
+  d$small_tree_ratio <- d$TPA_under3 / d$TPA_Total
+  d$size             <- d$size_ac * 0.4046856422
+  d$BA               <- d$BA_ac * 0.22956841138
+  d$avg_shrub_ht     <- d$avg_shrub_ht_ft * 0.3048
+  d$TPH              <- d$TPA_Total * 2.47105
+  d$neighbor_ht      <- d$neighbor_ht_ft * 0.3048
+  d$ln_march_sd      <- log(d$march_sd + 1)
+  
+  out <- d[, c("gap_ID", "march_sd", "SDD_n", "age", "slope", "TPH",
+               "avg_shrub_ht", "per_shrub_cover", "BA", "neighbor_ht",
+               "size", "small_tree_ratio", "northness", "eastness", "ln_march_sd")]
+  return(out)
+}
+
+# Helper: readable label for each scenario (used in plots and tables)
+scenario_label <- function(ctrl_age) {
+  if (is.na(ctrl_age)) "No controls" else paste0("Age ", ctrl_age)
+}
+```
+
+---
+
+## PART 1 SENSITIVITY: MLR Models for ln(March snow depth) and SDD
+
+For each scenario (age 50/60/70/80 and no control sites), this section re-runs:
+1. The nested ANOVA test (does adding age improve the model?)
+2. The best final MLR model for ln_march_sd and SDD_n
+3. Collects key statistics into a summary table
+
+# =============================================================================
+# STEP 1 — AICc REVIEW
+# Run this chunk first. It prints a full AICc table for every scenario so you
+# can decide which model to select. Look at the delta_AICc column:
+#   - delta = 0 is the best model by AICc
+#   - If a simpler model (fewer predictors) has delta < ~2, prefer it (parsimony)
+# After reviewing the output, fill in your choices in STEP 2 below.
+# =============================================================================
+
+```{r part1_aicc_review, warning=FALSE}
+
+for (ctrl_age in SENSITIVITY_AGES) {
+
+  label <- scenario_label(ctrl_age)
+  pd    <- process_raw_data(raw_data, ctrl_age)
+  n_pd  <- nrow(pd)
+
+  cat("\n\n========================================================\n")
+  cat("  AICc review | scenario:", label, "| n =", n_pd, "\n")
+  cat("========================================================\n")
+
+  # --- ln(March SD) ---
+  mod_ln  <- lm(ln_march_sd ~ age + slope + size + BA + TPH + avg_shrub_ht +
+                  per_shrub_cover + neighbor_ht + northness + eastness +
+                  small_tree_ratio, data = pd)
+  sub_ln  <- ols_step_best_subset(mod_ln)$metrics
+  k_ln    <- seq_len(nrow(sub_ln))
+  aicc_ln <- sub_ln$aic + (2 * k_ln * (k_ln + 1)) / (n_pd - k_ln - 1)
+
+  cat("\n--- ln(March SD) ---\n")
+  print(data.frame(
+    n_pred     = k_ln,
+    AIC        = round(sub_ln$aic,  3),
+    AICc       = round(aicc_ln,     3),
+    delta_AICc = round(aicc_ln - min(aicc_ln), 3),
+    predictors = sub_ln$predictors
+  ), row.names = FALSE)
+
+  # --- SDD ---
+  mod_SDD  <- lm(SDD_n ~ age + slope + size + BA + TPH + avg_shrub_ht +
+                   per_shrub_cover + neighbor_ht + northness + eastness +
+                   small_tree_ratio, data = pd)
+  sub_SDD  <- ols_step_best_subset(mod_SDD)$metrics
+  k_SDD    <- seq_len(nrow(sub_SDD))
+  aicc_SDD <- sub_SDD$aic + (2 * k_SDD * (k_SDD + 1)) / (n_pd - k_SDD - 1)
+
+  cat("\n--- SDD ---\n")
+  print(data.frame(
+    n_pred     = k_SDD,
+    AIC        = round(sub_SDD$aic, 3),
+    AICc       = round(aicc_SDD,    3),
+    delta_AICc = round(aicc_SDD - min(aicc_SDD), 3),
+    predictors = sub_SDD$predictors
+  ), row.names = FALSE)
+}
+```
+
+---
+
+# =============================================================================
+# STEP 2 — *** MANUAL MODEL SELECTION — FILL IN YOUR CHOICES HERE ***
+#
+# After reviewing the AICc tables printed by STEP 1, enter the best-model
+# formula for each scenario below. Guidelines:
+#   - Choose the model with the lowest AICc.
+#   - If a simpler model (one fewer predictor) has delta_AICc < 2, choose the
+#     simpler one for parsimony. Note your reasoning in the comment.
+#   - Do NOT change the left-hand side (ln_march_sd ~ / SDD_n ~).
+#   - Use the exact predictor names printed in the AICc review table.
+# =============================================================================
+
+```{r part1_manual_selection}
+
+# --- ln(March SD) best models ---
+# Scenario "Age 50": | chosen model: 5 predictors
+ln_formula_50 <- ln_march_sd ~ age + slope + TPH + avg_shrub_ht + per_shrub_cover
+
+# Scenario "Age 60": | chosen model: 5 predictors
+ln_formula_60 <- ln_march_sd ~ age + slope + TPH + avg_shrub_ht + per_shrub_cover
+
+# Scenario "Age 70": | chosen model: 5 predictors
+ln_formula_70 <- ln_march_sd ~ age + slope + TPH + avg_shrub_ht + per_shrub_cover
+
+# Scenario "Age 80": | chosen model: 6 predictors
+# (northness added here because delta_AICc for the 6-predictor model was < 2)
+ln_formula_80 <- ln_march_sd ~ age + slope + TPH + avg_shrub_ht + per_shrub_cover + northness
+
+# Scenario "No controls": | chosen model: 5 predictors
+ln_formula_nocontrols <- ln_march_sd ~ age + slope + TPH + avg_shrub_ht + per_shrub_cover
+
+# Collect into a named list — names must match scenario_label() output exactly
+ln_formulas <- list(
+  "Age 50"      = ln_formula_50,
+  "Age 60"      = ln_formula_60,
+  "Age 70"      = ln_formula_70,
+  "Age 80"      = ln_formula_80,
+  "No controls" = ln_formula_nocontrols
+)
+
+# --- SDD best models ---
+# Scenario "Age 50": | chosen model: 2 predictors
+SDD_formula_50 <- SDD_n ~ age + TPH
+
+# Scenario "Age 60": | chosen model: 3 predictors
+SDD_formula_60 <- SDD_n ~ age + TPH + avg_shrub_ht
+
+# Scenario "Age 70": | chosen model: 2 predictors
+SDD_formula_70 <- SDD_n ~ age + avg_shrub_ht
+
+# Scenario "Age 80": | chosen model: 2 predictors
+SDD_formula_80 <- SDD_n ~ age + avg_shrub_ht
+
+# Scenario "No controls": | chosen model: 2 predictors
+SDD_formula_nocontrols <- SDD_n ~ age + TPH
+
+# Collect into a named list
+SDD_formulas <- list(
+  "Age 50"      = SDD_formula_50,
+  "Age 60"      = SDD_formula_60,
+  "Age 70"      = SDD_formula_70,
+  "Age 80"      = SDD_formula_80,
+  "No controls" = SDD_formula_nocontrols
+)
+```
+
+---
+
+# =============================================================================
+# STEP 3 — MAIN SENSITIVITY LOOP
+# Uses the formulas you defined in STEP 2. Do not edit this chunk unless the
+# model structure changes.
+# =============================================================================
+
+```{r part1_sensitivity, warning=FALSE}
+
+mlr_results <- list()
+ln_models   <- list()
+SDD_models  <- list()
+
+for (ctrl_age in SENSITIVITY_AGES) {
+
+  label <- scenario_label(ctrl_age)
+  cat("\n\n====================================================\n")
+  cat("  Running Part 1 MLR sensitivity | scenario:", label, "\n")
+  cat("====================================================\n")
+
+  pd <- process_raw_data(raw_data, ctrl_age)
+  
+  # -------------------------------------------------------
+  # 1A: Does adding age improve the ln_march_sd model?
+  # -------------------------------------------------------
+  ln_marchsd_model4     <- lm(ln_march_sd ~ slope + BA + TPH + neighbor_ht, data = pd)
+  ln_marchsd_model4_age <- lm(ln_march_sd ~ age + slope + BA + TPH + neighbor_ht, data = pd)
+  
+  anova_ln      <- anova(ln_marchsd_model4, ln_marchsd_model4_age)
+  anova_ln_pval <- anova_ln$`Pr(>F)`[2]
+  
+  aicc_ln_no_age <- AICc(ln_marchsd_model4)
+  aicc_ln_age    <- AICc(ln_marchsd_model4_age)
+  
+  # -------------------------------------------------------
+  # 1B: Best MLR model for ln_march_sd
+  # Formula defined in STEP 2 (part1_manual_selection chunk above)
+  # -------------------------------------------------------
+  ln_best         <- lm(ln_formulas[[label]], data = pd)
+  ln_best_summary <- summary(ln_best)
+  cat("\nln(March SD) best model formula:\n")
+  print(formula(ln_best))
+
+  age_coef_ln   <- coef(ln_best)["age"]
+  age_pval_ln   <- ln_best_summary$coefficients["age", "Pr(>|t|)"]
+  age_se_ln     <- ln_best_summary$coefficients["age", "Std. Error"]
+  model_pval_ln <- pf(ln_best_summary$fstatistic[1],
+                      ln_best_summary$fstatistic[2],
+                      ln_best_summary$fstatistic[3],
+                      lower.tail = FALSE)
+  adjr2_ln      <- ln_best_summary$adj.r.squared
+  
+  # -------------------------------------------------------
+  # 1C: Does adding age improve the SDD model?
+  # -------------------------------------------------------
+  SDD_model2     <- lm(SDD_n ~ size + small_tree_ratio, data = pd)
+  SDD_model2_age <- lm(SDD_n ~ age + size + small_tree_ratio, data = pd)
+  
+  anova_SDD      <- anova(SDD_model2, SDD_model2_age)
+  anova_SDD_pval <- anova_SDD$`Pr(>F)`[2]
+  
+  aicc_SDD_no_age <- AICc(SDD_model2)
+  aicc_SDD_age    <- AICc(SDD_model2_age)
+  
+  # -------------------------------------------------------
+  # 1D: Best MLR model for SDD
+  # Formula defined in STEP 2 (part1_manual_selection chunk above)
+  # -------------------------------------------------------
+  SDD_best         <- lm(SDD_formulas[[label]], data = pd)
+  SDD_best_summary <- summary(SDD_best)
+  cat("\nSDD best model formula:\n")
+  print(formula(SDD_best))
+
+  age_coef_SDD   <- coef(SDD_best)["age"]
+  age_pval_SDD   <- SDD_best_summary$coefficients["age", "Pr(>|t|)"]
+  age_se_SDD     <- SDD_best_summary$coefficients["age", "Std. Error"]
+  model_pval_SDD <- pf(SDD_best_summary$fstatistic[1],
+                       SDD_best_summary$fstatistic[2],
+                       SDD_best_summary$fstatistic[3],
+                       lower.tail = FALSE)
+  adjr2_SDD      <- SDD_best_summary$adj.r.squared
+  
+  # Store fitted models for modelsummary tables
+  ln_models[[label]]  <- ln_best
+  SDD_models[[label]] <- SDD_best
+
+  # -------------------------------------------------------
+  # Store results
+  # -------------------------------------------------------
+  mlr_results[[label]] <- data.frame(
+    scenario            = label,
+    n_sites             = nrow(pd),   # track sample size so removal is obvious
+    
+    # ln_march_sd nested ANOVA
+    anova_pval_ln_marchsd = round(anova_ln_pval, 5),
+    aicc_ln_no_age        = round(aicc_ln_no_age, 3),
+    aicc_ln_with_age      = round(aicc_ln_age, 3),
+    aicc_improvement_ln   = round(aicc_ln_no_age - aicc_ln_age, 3),
+    
+    # ln_march_sd best model
+    age_coef_ln_best   = round(age_coef_ln, 5),
+    age_pval_ln_best   = round(age_pval_ln, 5),
+    age_se_ln_best     = round(age_se_ln, 5),
+    model_pval_ln_best = round(model_pval_ln, 5),
+    adjR2_ln_best      = round(adjr2_ln, 4),
+    
+    # SDD nested ANOVA
+    anova_pval_SDD       = round(anova_SDD_pval, 5),
+    aicc_SDD_no_age      = round(aicc_SDD_no_age, 3),
+    aicc_SDD_with_age    = round(aicc_SDD_age, 3),
+    aicc_improvement_SDD = round(aicc_SDD_no_age - aicc_SDD_age, 3),
+    
+    # SDD best model
+    age_coef_SDD_best   = round(age_coef_SDD, 5),
+    age_pval_SDD_best   = round(age_pval_SDD, 5),
+    age_se_SDD_best     = round(age_se_SDD, 5),
+    model_pval_SDD_best = round(model_pval_SDD, 5),
+    adjR2_SDD_best      = round(adjr2_SDD, 4)
+  )
+}
+
+part1_sensitivity_table <- do.call(rbind, mlr_results)
+rownames(part1_sensitivity_table) <- NULL
+
+cat("\n\n===== PART 1 SENSITIVITY ANALYSIS RESULTS =====\n")
+print(part1_sensitivity_table)
+
+
+library(modelsummary)
+
+# ln_models and SDD_models were populated in the STEP 3 loop above using the
+# manually-selected formulas from STEP 2. Column names below must stay in the
+# same order as SENSITIVITY_AGES (50, 60, 70, 80, NA).
+names(ln_models)  <- c("50 years", "60 years\n(original)", "70 years", "80 years", "Controls\nExcluded")
+names(SDD_models) <- c("50 years", "60 years\n(original)", "70 years", "80 years", "Controls\nExcluded")
+
+# --- Shared display options ---
+coef_rename <- c(
+  "(Intercept)"     = "Intercept",
+  "age"             = "age",
+  "slope"           = "slope",
+  "TPH"             = "TPH",
+  "avg_shrub_ht"    = "Average shrub height",
+  "per_shrub_cover" = "Percent shrub cover",
+  "northness"       = "northness"
+)
+
+gof_rows <- data.frame(
+  term = c("Adjusted R²", "P-value", "Observations"),
+  check.names = FALSE
+)
+
+# --- Inject model p-value as a custom GOF statistic ---
+# glance_custom.lm adds an extra column to broom::glance() output so that
+# modelsummary picks it up cleanly via gof_map (avoids the add_rows/position issue)
+glance_custom.lm <- function(x, ...) {
+  f     <- summary(x)$fstatistic
+  p_val <- pf(f[1], f[2], f[3], lower.tail = FALSE)
+  p_str <- ifelse(p_val < 0.001, "< 0.001",
+           ifelse(p_val < 0.01,  formatC(p_val, digits = 3, format = "f"),
+                                 formatC(p_val, digits = 3, format = "f")))
+  tibble::tibble(`model_p_value` = p_str)
+}
+
+# --- Table S1: ln(March SD) ---
+modelsummary(
+  ln_models,
+  estimate  = "{estimate}{stars}",
+  statistic = "({std.error})",
+  fmt       = 4,
+  coef_map  = coef_rename,
+  gof_map   = list(
+    list(raw = "adj.r.squared", clean = "Adjusted R²",  fmt = 4),
+    list(raw = "model_p_value", clean = "P-value",       fmt = function(x) x),
+    list(raw = "nobs",          clean = "Observations",  fmt = 0)
+  ),
+  stars     = c("*" = 0.05, "**" = 0.01, "***" = 0.001),
+  title     = "Table S1. Model outputs | ln(March snow depth) across different control age designations",
+  notes     = "Standard Error (SE) in parentheses. * p < 0.05, ** p < 0.01, *** p < 0.001",
+  output    = "kableExtra"
+)
+
+# --- Table S2: Snow Disappearance Date ---
+coef_rename_SDD <- c(
+  "(Intercept)"  = "Intercept",
+  "age"          = "age",
+  "TPH"          = "TPH",
+  "avg_shrub_ht" = "Average shrub height"
+)
+
+modelsummary(
+  SDD_models,
+  estimate  = "{estimate}{stars}",
+  statistic = "({std.error})",
+  fmt       = 4,
+  coef_map  = coef_rename_SDD,
+  gof_map   = list(
+    list(raw = "adj.r.squared", clean = "Adjusted R²",  fmt = 4),
+    list(raw = "model_p_value", clean = "P-value",       fmt = function(x) x),
+    list(raw = "nobs",          clean = "Observations",  fmt = 0)
+  ),
+  stars     = c("*" = 0.05, "**" = 0.01, "***" = 0.001),
+  title     = "Table S2. Model outputs | Snow disappearance date across different control age designations",
+  notes     = "Standard Error (SE) in parentheses. * p < 0.05, ** p < 0.01, *** p < 0.001",
+  output    = "kableExtra"
+)
+```
+
+
+# =============================================================================
+# ANOVA TABLE: Does adding age improve the best base model?
+# Produces Table S1 (ln March SD) and Table S2 (SDD) in the format:
+#   Control Site Age | Model (base / +age) | Predictors | AICc | Adj R² | F(df1,df2) | p-value
+# =============================================================================
+
+# STEP A — Review AICc tables for base models (WITHOUT age)
+# Run this chunk first, then fill in your chosen formulas in STEP B.
+
+```{r anova_base_review, warning=FALSE}
+
+for (ctrl_age in SENSITIVITY_AGES) {
+  label <- scenario_label(ctrl_age)
+  pd    <- process_raw_data(raw_data, ctrl_age)
+  n_pd  <- nrow(pd)
+
+  cat("\n\n========================================\n")
+  cat("Base model (no age) | scenario:", label, "| n =", n_pd, "\n")
+  cat("========================================\n")
+
+  # ln(March SD) — full model without age
+  mod_ln <- lm(ln_march_sd ~ slope + size + BA + TPH + avg_shrub_ht +
+                 per_shrub_cover + neighbor_ht + northness + eastness +
+                 small_tree_ratio, data = pd)
+  sub_ln  <- ols_step_best_subset(mod_ln)$metrics
+  k_ln    <- seq_len(nrow(sub_ln))
+  aicc_ln <- sub_ln$aic + (2 * k_ln * (k_ln + 1)) / (n_pd - k_ln - 1)
+
+  cat("\n--- ln(March SD) without age ---\n")
+  print(data.frame(
+    n_pred     = k_ln,
+    AICc       = round(aicc_ln,              3),
+    delta_AICc = round(aicc_ln - min(aicc_ln), 3),
+    predictors = sub_ln$predictors
+  ), row.names = FALSE)
+
+  # SDD — full model without age
+  mod_SDD  <- lm(SDD_n ~ slope + size + BA + TPH + avg_shrub_ht +
+                   per_shrub_cover + neighbor_ht + northness + eastness +
+                   small_tree_ratio, data = pd)
+  sub_SDD  <- ols_step_best_subset(mod_SDD)$metrics
+  k_SDD    <- seq_len(nrow(sub_SDD))
+  aicc_SDD <- sub_SDD$aic + (2 * k_SDD * (k_SDD + 1)) / (n_pd - k_SDD - 1)
+
+  cat("\n--- SDD without age ---\n")
+  print(data.frame(
+    n_pred     = k_SDD,
+    AICc       = round(aicc_SDD,               3),
+    delta_AICc = round(aicc_SDD - min(aicc_SDD), 3),
+    predictors = sub_SDD$predictors
+  ), row.names = FALSE)
+}
+```
+
+---
+
+# STEP B — *** MANUAL SELECTION: base model formulas (WITHOUT age) ***
+# After reviewing STEP A output, enter the best base model for each scenario.
+# Same rule as before: lowest AICc; prefer simpler model if delta < 2.
+
+```{r anova_base_manual}
+
+# --- ln(March SD) base formulas (no age) ---
+ln_base_formulas <- list(
+  "Age 50"      = ln_march_sd ~ slope + BA + TPH + neighbor_ht,   # AICc = ??? | ??? predictors
+  "Age 60"      = ln_march_sd ~ slope + BA + TPH + neighbor_ht,   # AICc = ??? | ??? predictors
+  "Age 70"      = ln_march_sd ~ slope + BA + TPH + neighbor_ht,   # AICc = ??? | ??? predictors
+  "Age 80"      = ln_march_sd ~ slope + BA + TPH + neighbor_ht,   # AICc = ??? | ??? predictors
+  "No controls" = ln_march_sd ~ slope + BA + TPH + neighbor_ht    # AICc = ??? | ??? predictors
+)
+
+# --- SDD base formulas (no age) ---
+SDD_base_formulas <- list(
+  "Age 50"      = SDD_n ~ size + small_tree_ratio,   # AICc = ??? | ??? predictors
+  "Age 60"      = SDD_n ~ size + small_tree_ratio,   # AICc = ??? | ??? predictors
+  "Age 70"      = SDD_n ~ size + small_tree_ratio,   # AICc = ??? | ??? predictors
+  "Age 80"      = SDD_n ~ size + small_tree_ratio,   # AICc = ??? | ??? predictors
+  "No controls" = SDD_n ~ size + small_tree_ratio    # AICc = ??? | ??? predictors
+)
+```
+
+---
+
+# STEP C — ANOVA loop and table (do not edit unless model structure changes)
+
+```{r anova_table, warning=FALSE}
+
+anova_rows_ln  <- list()
+anova_rows_SDD <- list()
+
+for (ctrl_age in SENSITIVITY_AGES) {
+  label <- scenario_label(ctrl_age)
+  pd    <- process_raw_data(raw_data, ctrl_age)
+
+  # Helper: pretty predictor string (removes response variable from formula)
+  pred_string <- function(f) {
+    preds <- all.vars(f)[-1]  # drop response variable
+    paste(preds, collapse = ", ")
+  }
+
+  # ── ln(March SD) ──────────────────────────────────────────────
+  base_ln    <- lm(ln_base_formulas[[label]], data = pd)
+  age_ln_f   <- update(ln_base_formulas[[label]], . ~ age + .)
+  age_ln     <- lm(age_ln_f, data = pd)
+  anova_ln   <- anova(base_ln, age_ln)
+
+  f_ln  <- anova_ln$F[2]
+  df1_ln <- anova_ln$Df[2]
+  df2_ln <- anova_ln$Res.Df[2]
+  pval_ln <- anova_ln$`Pr(>F)`[2]
+
+  anova_rows_ln[[label]] <- data.frame(
+    scenario       = label,
+    model          = c("base", "+ age"),
+    predictors     = c(pred_string(ln_base_formulas[[label]]),
+                       paste("age,", pred_string(ln_base_formulas[[label]]))),
+    AICc           = c(round(AICc(base_ln), 3), round(AICc(age_ln), 3)),
+    adj_R2         = c(round(summary(base_ln)$adj.r.squared, 3),
+                       round(summary(age_ln)$adj.r.squared,  3)),
+    F_stat         = c(NA, paste0("F(", df1_ln, ", ", df2_ln, ") = ", round(f_ln, 2))),
+    p_value        = c(NA, ifelse(pval_ln < 0.001, "< 0.001", round(pval_ln, 3))),
+    stringsAsFactors = FALSE
+  )
+
+  # ── SDD ───────────────────────────────────────────────────────
+  base_SDD   <- lm(SDD_base_formulas[[label]], data = pd)
+  age_SDD_f  <- update(SDD_base_formulas[[label]], . ~ age + .)
+  age_SDD    <- lm(age_SDD_f, data = pd)
+  anova_SDD  <- anova(base_SDD, age_SDD)
+
+  f_SDD   <- anova_SDD$F[2]
+  df1_SDD  <- anova_SDD$Df[2]
+  df2_SDD  <- anova_SDD$Res.Df[2]
+  pval_SDD <- anova_SDD$`Pr(>F)`[2]
+
+  anova_rows_SDD[[label]] <- data.frame(
+    scenario       = label,
+    model          = c("base", "+ age"),
+    predictors     = c(pred_string(SDD_base_formulas[[label]]),
+                       paste("age,", pred_string(SDD_base_formulas[[label]]))),
+    AICc           = c(round(AICc(base_SDD), 3), round(AICc(age_SDD), 3)),
+    adj_R2         = c(round(summary(base_SDD)$adj.r.squared, 3),
+                       round(summary(age_SDD)$adj.r.squared,  3)),
+    F_stat         = c(NA, paste0("F(", df1_SDD, ", ", df2_SDD, ") = ", round(f_SDD, 2))),
+    p_value        = c(NA, ifelse(pval_SDD < 0.001, "< 0.001", round(pval_SDD, 3))),
+    stringsAsFactors = FALSE
+  )
+}
+
+anova_table_ln  <- do.call(rbind, anova_rows_ln)
+anova_table_SDD <- do.call(rbind, anova_rows_SDD)
+
+# ── Format tables with kableExtra ─────────────────────────────
+library(kableExtra)
+
+format_anova_table <- function(tbl, title) {
+  display <- tbl[, c("model", "predictors", "AICc", "adj_R2", "F_stat", "p_value")]
+  colnames(display) <- c("Model", "Predictors", "AICc", "Adj. R²", "F(df1,df2)", "p-value")
+
+  # Row indices for each scenario group (2 rows per scenario)
+  scenarios <- unique(tbl$scenario)
+  group_starts <- seq(1, nrow(tbl), by = 2)
+
+  k <- kable(display, format = "html", align = c("l","l","r","r","r","r"),
+             caption = title, na_col = "") %>%
+    kable_styling(full_width = FALSE, bootstrap_options = c("striped", "bordered"))
+
+  for (i in seq_along(scenarios)) {
+    k <- k %>% pack_rows(scenarios[i], group_starts[i], group_starts[i] + 1)
+  }
+  k
+}
+
+format_anova_table(
+  anova_table_ln,
+  "ANOVA testing with and without age as a predictor for ln(March Snow Depth)"
+)
+
+format_anova_table(
+  anova_table_SDD,
+  "ANOVA testing with and without age as a predictor for Snow Disappearance Date"
+)
+```
+
+```{r check_subset_structure}
+# Run this FIRST to see exactly what column names ols_step_best_subset returns
+pd_test    <- process_raw_data(raw_data, 60)
+mod_test   <- lm(ln_march_sd ~ age + slope + size + BA + TPH + avg_shrub_ht +
+                   per_shrub_cover + neighbor_ht + northness + eastness +
+                   small_tree_ratio, data = pd_test)
+subsets_test <- ols_step_best_subset(mod_test)
+
+# Check the column names and first few rows
+cat("Column names:\n")
+print(names(subsets_test))
+
+cat("\nFirst few rows:\n")
+print(head(subsets_test))
+```
+```{r part1_predictor_stability, warning=FALSE, message=FALSE}
+
+predictor_results <- list()
+
+for (ctrl_age in SENSITIVITY_AGES) {
+  
+  label <- scenario_label(ctrl_age)
+  pd    <- process_raw_data(raw_data, ctrl_age)
+  
+  # --- ln_march_sd: full model WITH age, then best subset ---
+  mod_ln_full  <- lm(ln_march_sd ~ age + slope + size + BA + TPH + avg_shrub_ht +
+                       per_shrub_cover + neighbor_ht + northness + eastness +
+                       small_tree_ratio, data = pd)
+  subsets_ln   <- ols_step_best_subset(mod_ln_full)$metrics  # <-- added $metrics
+  
+  # --- SDD: full model WITH age, then best subset ---
+  mod_SDD_full <- lm(SDD_n ~ age + slope + size + BA + TPH + avg_shrub_ht +
+                       per_shrub_cover + neighbor_ht + northness + eastness +
+                       small_tree_ratio, data = pd)
+  subsets_SDD  <- ols_step_best_subset(mod_SDD_full)$metrics  # <-- added $metrics
+  
+  # --- Calculate AICc for each subset size ---
+  n <- nrow(pd)
+  
+  calc_AICc <- function(aic_vec, n) {
+    sapply(seq_along(aic_vec), function(i) {
+      k <- i
+      aic_vec[i] + (2 * k * (k + 1)) / (n - k - 1)
+    })
+  }
+  
+  aicc_ln  <- calc_AICc(subsets_ln$aic,  n)
+  aicc_SDD <- calc_AICc(subsets_SDD$aic, n)
+  
+  best_ln  <- which.min(aicc_ln)
+  best_SDD <- which.min(aicc_SDD)
+  
+  predictor_results[[label]] <- data.frame(
+    scenario              = label,
+    n_sites               = n,
+    ln_best_n_predictors  = best_ln,
+    ln_best_AICc          = round(aicc_ln[best_ln], 3),
+    ln_best_predictors    = subsets_ln$predictors[best_ln],
+    SDD_best_n_predictors = best_SDD,
+    SDD_best_AICc         = round(aicc_SDD[best_SDD], 3),
+    SDD_best_predictors   = subsets_SDD$predictors[best_SDD]
+  )
+}
+
+predictor_stability_table <- do.call(rbind, predictor_results)
+rownames(predictor_stability_table) <- NULL
+
+cat("\n===== PREDICTOR STABILITY CHECK =====\n")
+cat("Did the best subset of predictors change across scenarios?\n\n")
+
+cat("--- ln(March Snow Depth) ---\n")
+print(predictor_stability_table[, c("scenario", "n_sites", "ln_best_n_predictors",
+                                     "ln_best_AICc", "ln_best_predictors")])
+
+cat("\n--- Snow Disappearance Date ---\n")
+print(predictor_stability_table[, c("scenario", "n_sites", "SDD_best_n_predictors",
+                                     "SDD_best_AICc", "SDD_best_predictors")])
+
+# --- Flag any changes from the Age 50 baseline ---
+ref_ln  <- predictor_stability_table$ln_best_predictors[1]
+ref_SDD <- predictor_stability_table$SDD_best_predictors[1]
+
+predictor_stability_table$ln_changed  <- predictor_stability_table$ln_best_predictors  != ref_ln
+predictor_stability_table$SDD_changed <- predictor_stability_table$SDD_best_predictors != ref_SDD
+
+cat("\n--- Change flags (TRUE = predictors changed from Age 50 baseline) ---\n")
+cat("ln(March SD):\n")
+print(predictor_stability_table[, c("scenario", "ln_changed", "ln_best_predictors")])
+
+cat("\nSDD:\n")
+print(predictor_stability_table[, c("scenario", "SDD_changed", "SDD_best_predictors")])
+```
+
+The only two things that changed from the broken version are adding `$metrics` when calling `ols_step_best_subset()` on lines 10 and 17, which is what was causing the `non-numeric argument` error since R was trying to do math on the list before drilling into the actual data frame inside it.
+
+What this does for each scenario: re-runs the full `ols_step_best_subset`, recalculates AICc for every subset size, finds the best model, and records which predictors were selected. The "Change flags" section at the bottom then directly tells you with `TRUE`/`FALSE` whether the selected predictors differed from the Age 50 baseline — so you don't have to compare the rows manually.
+
+---
+
+## PART 1: Visualize sensitivity across scenarios
+
+The x-axis shows age scenarios (50, 60, 70, 80) plus the "No controls" scenario,
+which is plotted separately as a horizontal reference line on each plot so you can
+see at a glance whether removing the sites entirely changes the story.
+
+```{r part1_sensitivity_plots, fig.width=12, fig.height=10}
+
+# Split into age-only rows (for lines) and no-controls row (for reference lines)
+p1_age  <- part1_sensitivity_table %>% filter(scenario != "No controls") %>%
+           mutate(age_num = as.numeric(gsub("Age ", "", scenario)))
+p1_noct <- part1_sensitivity_table %>% filter(scenario == "No controls")
+
+make_part1_plot <- function(y_col, y_label, title_text,
+                            hline = NULL, hline_label = NULL,
+                            line_color = "steelblue") {
+  p <- ggplot(p1_age, aes(x = age_num, y = .data[[y_col]])) +
+    geom_line(color = line_color, linewidth = 1.2) +
+    geom_point(size = 3, color = line_color) +
+    geom_vline(xintercept = 60, linetype = "dashed", color = "red", alpha = 0.6) +
+    # "No controls" as a horizontal dashed line
+    geom_hline(yintercept = p1_noct[[y_col]],
+               linetype = "dotdash", color = "darkgreen", linewidth = 1) +
+    annotate("text", x = 52, y = p1_noct[[y_col]],
+             label = "No controls", color = "darkgreen", vjust = -0.5, size = 3) +
+    labs(title = title_text,
+         subtitle = "Red dashed = original (60 yr) | Green dot-dash = no control sites",
+         x = "Control Site Age (years)", y = y_label) +
+    theme_minimal() +
+    theme(plot.subtitle = element_text(size = 8, color = "gray40"))
+  
+  if (!is.null(hline)) {
+    p <- p + geom_hline(yintercept = hline, linetype = "dashed", color = "gray40") +
+      annotate("text", x = 79, y = hline, label = hline_label,
+               vjust = -0.5, size = 3, color = "gray40")
+  }
+  return(p)
+}
+
+pa <- make_part1_plot("age_coef_ln_best",  "Age Coefficient",
+                      "ln(March SD): age coefficient")
+pb <- make_part1_plot("age_pval_ln_best",  "p-value (age)",
+                      "ln(March SD): age p-value",
+                      hline = 0.05, hline_label = "p=0.05")
+pc <- make_part1_plot("adjR2_ln_best",     "Adjusted R²",
+                      "ln(March SD): Adjusted R²", line_color = "steelblue")
+pd_plot <- make_part1_plot("aicc_improvement_ln", "AICc reduction",
+                      "ln(March SD): AICc improvement from adding age",
+                      hline = 2, hline_label = "ΔAIC=2")
+
+pe <- make_part1_plot("age_coef_SDD_best", "Age Coefficient",
+                      "SDD: age coefficient",         line_color = "darkorange")
+pf_plot <- make_part1_plot("age_pval_SDD_best", "p-value (age)",
+                      "SDD: age p-value",
+                      hline = 0.05, hline_label = "p=0.05", line_color = "darkorange")
+pg <- make_part1_plot("adjR2_SDD_best",    "Adjusted R²",
+                      "SDD: Adjusted R²",             line_color = "darkorange")
+ph <- make_part1_plot("aicc_improvement_SDD", "AICc reduction",
+                      "SDD: AICc improvement from adding age",
+                      hline = 2, hline_label = "ΔAIC=2", line_color = "darkorange")
+
+grid.arrange(pa, pb, pc, pd_plot, pe, pf_plot, pg, ph, ncol = 2,
+             top = "Part 1 Sensitivity: Age Assignment vs. Removal of Control Sites")
+```
+
+---
+
+## PART 3 SENSITIVITY: Accumulation and Ablation MLR Models
+
+```{r part3_sensitivity_setup, message=FALSE, warning=FALSE}
+snowdepth_TSA       <- read_excel("snowdepth_TSA.xlsx")
+snowdepth_TSA$Date  <- as.Date(snowdepth_TSA$Date)
+
+# Helper: simple start-to-end accumulation rate
+calculate_accumulation_rate <- function(data, start_date, end_date, gap_ids) {
+  start_depths <- data[data$Date == start_date, gap_ids, drop = FALSE]
+  end_depths   <- data[data$Date == end_date,   gap_ids, drop = FALSE]
+  duration     <- as.numeric(end_date - start_date)
+  return((end_depths - start_depths) / duration)
+}
+
+# Helper: ablation rate (handles sites that reach 0 before period end)
+calculate_ablation_rates <- function(df, start_date, end_date) {
+  subset_df      <- df[df$Date >= start_date & df$Date <= end_date, ]
+  ablation_rates <- numeric(ncol(subset_df) - 1)
+  names(ablation_rates) <- colnames(subset_df)[-1]
+  for (site in colnames(subset_df)[-1]) {
+    site_data   <- subset_df[, c("Date", site)]
+    start_depth <- site_data[site_data$Date == start_date, 2]
+    if (length(start_depth) == 0 || is.na(start_depth)) { ablation_rates[site] <- NA; next }
+    zero_dates  <- site_data$Date[site_data[, 2] == 0]
+    zero_dates  <- zero_dates[zero_dates > start_date]
+    if (length(zero_dates) > 0) {
+      ablation_rates[site] <- start_depth / as.numeric(min(zero_dates) - start_date)
+    } else {
+      end_depth <- site_data[site_data$Date == end_date, 2]
+      ablation_rates[site] <- if (length(end_depth) == 0 || is.na(end_depth)) NA else
+        (start_depth - end_depth) / as.numeric(end_date - start_date)
+    }
+  }
+  return(ablation_rates)
+}
+
+# Pre-compute rates (these don't change with age assignment)
+gap_ids <- names(snowdepth_TSA)[names(snowdepth_TSA) != "Date"]
+
+accum_rates_df <- data.frame(
+  gap_ID = gsub("^C", "", gap_ids),
+  accum1 = as.numeric(calculate_accumulation_rate(snowdepth_TSA, as.Date("2021-01-21"), as.Date("2021-01-22"), gap_ids)[1, ]),
+  accum2 = as.numeric(calculate_accumulation_rate(snowdepth_TSA, as.Date("2021-01-24"), as.Date("2021-01-25"), gap_ids)[1, ]),
+  accum4 = as.numeric(calculate_accumulation_rate(snowdepth_TSA, as.Date("2021-02-19"), as.Date("2021-02-20"), gap_ids)[1, ]),
+  accum5 = as.numeric(calculate_accumulation_rate(snowdepth_TSA, as.Date("2021-03-08"), as.Date("2021-03-11"), gap_ids)[1, ]),
+  accum6 = as.numeric(calculate_accumulation_rate(snowdepth_TSA, as.Date("2021-03-14"), as.Date("2021-03-15"), gap_ids)[1, ])
+)
+
+ablat_rates_df <- data.frame(
+  gap_ID = gsub("^C", "", gap_ids),
+  ablat1 = as.numeric(unlist(calculate_ablation_rates(snowdepth_TSA, as.Date("2021-01-31"), as.Date("2021-02-19")))),
+  ablat2 = as.numeric(unlist(calculate_ablation_rates(snowdepth_TSA, as.Date("2021-02-20"), as.Date("2021-03-08")))),
+  ablat3 = as.numeric(unlist(calculate_ablation_rates(snowdepth_TSA, as.Date("2021-03-11"), as.Date("2021-03-14")))),
+  ablat4 = as.numeric(unlist(calculate_ablation_rates(snowdepth_TSA, as.Date("2021-03-16"), as.Date("2021-04-03"))))
+)
+```
+
+# =============================================================================
+# PART 3 MODEL SELECTION — same three-step process as Part 1
+#
+# STEP A: Run this chunk first — prints AICc tables for every event × scenario
+# STEP B: Fill in your chosen formulas based on what STEP A prints
+# STEP C: The main loop uses those formulas (do not edit)
+# =============================================================================
+
+```{r part3_aicc_review, warning=FALSE}
+
+# Events to review — response variable name and label for printing
+EVENTS <- list(
+  list(resp = "accum1", label = "accum1 (storm 1 accumulation)"),
+  list(resp = "accum2", label = "accum2 (storm 2 accumulation)"),
+  list(resp = "accum4", label = "accum4 (storm 4 accumulation)"),
+  list(resp = "accum5", label = "accum5 (storm 5 accumulation)"),
+  list(resp = "accum6", label = "accum6 (storm 6 accumulation)"),
+  list(resp = "ablat1", label = "ablat1 (ablation period 1)"),
+  list(resp = "ablat2", label = "ablat2 (ablation period 2)"),
+  list(resp = "ablat3", label = "ablat3 (ablation period 3)"),
+  list(resp = "ablat4", label = "ablat4 (ablation period 4)")
+)
+
+for (ctrl_age in SENSITIVITY_AGES) {
+  label <- scenario_label(ctrl_age)
+  pd    <- process_raw_data(raw_data, ctrl_age) %>%
+    left_join(accum_rates_df, by = "gap_ID") %>%
+    left_join(ablat_rates_df, by = "gap_ID")
+  n_pd  <- nrow(pd)
+
+  cat("\n\n========================================================\n")
+  cat("  AICc review | scenario:", label, "| n =", n_pd, "\n")
+  cat("========================================================\n")
+
+  for (ev in EVENTS) {
+    full_f <- as.formula(paste(ev$resp,
+      "~ age + slope + size + BA + TPH + avg_shrub_ht +
+       per_shrub_cover + neighbor_ht + northness + eastness + small_tree_ratio"))
+    mod     <- lm(full_f, data = pd)
+    sub     <- ols_step_best_subset(mod)$metrics
+    k_vec   <- seq_len(nrow(sub))
+    aicc    <- sub$aic + (2 * k_vec * (k_vec + 1)) / (n_pd - k_vec - 1)
+
+    cat("\n---", ev$label, "---\n")
+    print(data.frame(
+      n_pred     = k_vec,
+      AICc       = round(aicc,              3),
+      delta_AICc = round(aicc - min(aicc),  3),
+      predictors = sub$predictors
+    ), row.names = FALSE)
+  }
+}
+```
+
+---
+
+# =============================================================================
+# STEP B — *** MANUAL MODEL SELECTION FOR PART 3 — FILL IN YOUR CHOICES ***
+#
+# One formula per event per scenario. Pre-filled with the original hardcoded
+# models as placeholders — update after reviewing STEP A output.
+# Rule: lowest AICc; if a simpler model is within 2 units, prefer it.
+# =============================================================================
+
+```{r part3_manual_selection}
+
+# Each entry is a named list: one formula per scenario label.
+# Names must exactly match scenario_label() output:
+#   "Age 50", "Age 60", "Age 70", "Age 80", "No controls"
+
+part3_formulas <- list(
+
+  accum1 = list(
+    "Age 50"      = accum1 ~ slope + BA + per_shrub_cover + neighbor_ht + northness,  # AICc=??? predictors=???
+    "Age 60"      = accum1 ~ slope + BA + per_shrub_cover + neighbor_ht + northness,
+    "Age 70"      = accum1 ~ slope + BA + per_shrub_cover + neighbor_ht + northness,
+    "Age 80"      = accum1 ~ slope + BA + per_shrub_cover + neighbor_ht + northness,
+    "No controls" = accum1 ~ slope + BA + per_shrub_cover + neighbor_ht + northness
+  ),
+
+  accum2 = list(
+    "Age 50"      = accum2 ~ age,
+    "Age 60"      = accum2 ~ age,
+    "Age 70"      = accum2 ~ age,
+    "Age 80"      = accum2 ~ age,
+    "No controls" = accum2 ~ age
+  ),
+
+  accum4 = list(
+    "Age 50"      = accum4 ~ age + slope + small_tree_ratio,
+    "Age 60"      = accum4 ~ age + slope + small_tree_ratio,
+    "Age 70"      = accum4 ~ age + slope + small_tree_ratio,
+    "Age 80"      = accum4 ~ age + slope + small_tree_ratio,
+    "No controls" = accum4 ~ age + slope + small_tree_ratio
+  ),
+
+  accum5 = list(
+    "Age 50"      = accum5 ~ age + northness + eastness,
+    "Age 60"      = accum5 ~ age + northness + eastness,
+    "Age 70"      = accum5 ~ age + northness + eastness,
+    "Age 80"      = accum5 ~ age + northness + eastness,
+    "No controls" = accum5 ~ age + northness + eastness
+  ),
+
+  accum6 = list(
+    "Age 50"      = accum6 ~ age + size + TPH + avg_shrub_ht + per_shrub_cover,
+    "Age 60"      = accum6 ~ age + size + TPH + avg_shrub_ht + per_shrub_cover,
+    "Age 70"      = accum6 ~ age + size + TPH + avg_shrub_ht + per_shrub_cover,
+    "Age 80"      = accum6 ~ age + size + TPH + avg_shrub_ht + per_shrub_cover,
+    "No controls" = accum6 ~ age + size + TPH + avg_shrub_ht + per_shrub_cover
+  ),
+
+  ablat1 = list(
+    "Age 50"      = ablat1 ~ age + slope + size + northness + eastness + small_tree_ratio,
+    "Age 60"      = ablat1 ~ age + slope + size + northness + eastness + small_tree_ratio,
+    "Age 70"      = ablat1 ~ age + slope + size + northness + eastness + small_tree_ratio,
+    "Age 80"      = ablat1 ~ age + slope + size + northness + eastness + small_tree_ratio,
+    "No controls" = ablat1 ~ age + slope + size + northness + eastness + small_tree_ratio
+  ),
+
+  ablat2 = list(
+    "Age 50"      = ablat2 ~ age + slope + small_tree_ratio,
+    "Age 60"      = ablat2 ~ age + slope + small_tree_ratio,
+    "Age 70"      = ablat2 ~ age + slope + small_tree_ratio,
+    "Age 80"      = ablat2 ~ age + slope + small_tree_ratio,
+    "No controls" = ablat2 ~ age + slope + small_tree_ratio
+  ),
+
+  ablat3 = list(
+    "Age 50"      = ablat3 ~ age + small_tree_ratio,
+    "Age 60"      = ablat3 ~ age + small_tree_ratio,
+    "Age 70"      = ablat3 ~ age + small_tree_ratio,
+    "Age 80"      = ablat3 ~ age + small_tree_ratio,
+    "No controls" = ablat3 ~ age + small_tree_ratio
+  ),
+
+  ablat4 = list(
+    "Age 50"      = ablat4 ~ avg_shrub_ht + per_shrub_cover + neighbor_ht,
+    "Age 60"      = ablat4 ~ avg_shrub_ht + per_shrub_cover + neighbor_ht,
+    "Age 70"      = ablat4 ~ avg_shrub_ht + per_shrub_cover + neighbor_ht,
+    "Age 80"      = ablat4 ~ avg_shrub_ht + per_shrub_cover + neighbor_ht,
+    "No controls" = ablat4 ~ avg_shrub_ht + per_shrub_cover + neighbor_ht
+  )
+)
+```
+
+---
+
+# STEP C — main loop uses part3_formulas defined above (do not edit)
+
+```{r part3_sensitivity_loop, warning=FALSE}
+part3_results <- list()
+
+for (ctrl_age in SENSITIVITY_AGES) {
+  
+  label <- scenario_label(ctrl_age)
+  cat("\n\n====================================================\n")
+  cat("  Running Part 3 sensitivity | scenario:", label, "\n")
+  cat("====================================================\n")
+  
+  pd <- process_raw_data(raw_data, ctrl_age) %>%
+    left_join(accum_rates_df, by = "gap_ID") %>%
+    left_join(ablat_rates_df, by = "gap_ID")
+  
+  # Accumulation and ablation models — formulas from part3_manual_selection (STEP B)
+  m_accum1 <- lm(part3_formulas$accum1[[label]], data = pd)
+  m_accum2 <- lm(part3_formulas$accum2[[label]], data = pd)
+  m_accum4 <- lm(part3_formulas$accum4[[label]], data = pd)
+  m_accum5 <- lm(part3_formulas$accum5[[label]], data = pd)
+  m_accum6 <- lm(part3_formulas$accum6[[label]], data = pd)
+  m_ablat1 <- lm(part3_formulas$ablat1[[label]], data = pd)
+  m_ablat2 <- lm(part3_formulas$ablat2[[label]], data = pd)
+  m_ablat3 <- lm(part3_formulas$ablat3[[label]], data = pd)
+  m_ablat4 <- lm(part3_formulas$ablat4[[label]], data = pd)
+  
+  get_age_pval <- function(s) {
+    if ("age" %in% rownames(s$coefficients)) round(s$coefficients["age", "Pr(>|t|)"], 5) else NA
+  }
+  get_age_coef <- function(s) {
+    if ("age" %in% rownames(s$coefficients)) round(s$coefficients["age", "Estimate"], 5) else NA
+  }
+  get_model_pval <- function(s) {
+    round(pf(s$fstatistic[1], s$fstatistic[2], s$fstatistic[3], lower.tail = FALSE), 5)
+  }
+  
+  s1  <- summary(m_accum1); s2  <- summary(m_accum2)
+  s4  <- summary(m_accum4); s5  <- summary(m_accum5); s6  <- summary(m_accum6)
+  sa1 <- summary(m_ablat1); sa2 <- summary(m_ablat2)
+  sa3 <- summary(m_ablat3); sa4 <- summary(m_ablat4)
+  
+  part3_results[[label]] <- data.frame(
+    scenario = label,
+    n_sites  = nrow(pd),
+    
+    # accum1 has no age predictor so we only store model-level stats
+    accum1_model_pval = get_model_pval(s1), accum1_adjR2 = round(s1$adj.r.squared, 4),
+    
+    accum2_age_coef = get_age_coef(s2), accum2_age_pval = get_age_pval(s2), accum2_adjR2 = round(s2$adj.r.squared, 4), accum2_model_pval = get_model_pval(s2),
+    accum4_age_coef = get_age_coef(s4), accum4_age_pval = get_age_pval(s4), accum4_adjR2 = round(s4$adj.r.squared, 4), accum4_model_pval = get_model_pval(s4),
+    accum5_age_coef = get_age_coef(s5), accum5_age_pval = get_age_pval(s5), accum5_adjR2 = round(s5$adj.r.squared, 4), accum5_model_pval = get_model_pval(s5),
+    accum6_age_coef = get_age_coef(s6), accum6_age_pval = get_age_pval(s6), accum6_adjR2 = round(s6$adj.r.squared, 4), accum6_model_pval = get_model_pval(s6),
+    
+    ablat1_age_coef = get_age_coef(sa1), ablat1_age_pval = get_age_pval(sa1), ablat1_adjR2 = round(sa1$adj.r.squared, 4), ablat1_model_pval = get_model_pval(sa1),
+    ablat2_age_coef = get_age_coef(sa2), ablat2_age_pval = get_age_pval(sa2), ablat2_adjR2 = round(sa2$adj.r.squared, 4), ablat2_model_pval = get_model_pval(sa2),
+    ablat3_age_coef = get_age_coef(sa3), ablat3_age_pval = get_age_pval(sa3), ablat3_adjR2 = round(sa3$adj.r.squared, 4), ablat3_model_pval = get_model_pval(sa3),
+    
+    # ablat4 has no age predictor so we only store model-level stats
+    ablat4_model_pval = get_model_pval(sa4), ablat4_adjR2 = round(sa4$adj.r.squared, 4)
+  )
+}
+
+part3_sensitivity_table <- do.call(rbind, part3_results)
+rownames(part3_sensitivity_table) <- NULL
+
+cat("\n\n===== PART 3 SENSITIVITY ANALYSIS RESULTS =====\n")
+print(part3_sensitivity_table)
+```
+
+Then the predictor stability chunk for Part 3 — this re-runs `ols_step_best_subset` for every accumulation and ablation variable across all scenarios:
+
+```{r part3_predictor_stability, warning=FALSE}
+
+# Models that include age as a predictor (these are the ones sensitive to control site age)
+accum_age_models <- c("accum2", "accum4", "accum5", "accum6")
+ablat_age_models <- c("ablat1", "ablat2", "ablat3")
+
+part3_predictor_results <- list()
+
+for (ctrl_age in SENSITIVITY_AGES) {
+  
+  label <- scenario_label(ctrl_age)
+  pd <- process_raw_data(raw_data, ctrl_age) %>%
+    left_join(accum_rates_df, by = "gap_ID") %>%
+    left_join(ablat_rates_df, by = "gap_ID")
+  
+  n <- nrow(pd)
+  
+  calc_AICc <- function(aic_vec, n) {
+    sapply(seq_along(aic_vec), function(i) {
+      k <- i
+      aic_vec[i] + (2 * k * (k + 1)) / (n - k - 1)
+    })
+  }
+  
+  row <- data.frame(scenario = label, n_sites = n)
+  
+  # Loop through each response variable that has age as a predictor
+  for (resp in c(accum_age_models, ablat_age_models)) {
+    
+    mod_full <- lm(as.formula(paste(resp,
+                   "~ age + slope + size + BA + TPH + avg_shrub_ht +
+                    per_shrub_cover + neighbor_ht + northness + eastness +
+                    small_tree_ratio")),
+                   data = pd)
+    
+    subsets  <- ols_step_best_subset(mod_full)$metrics
+    aicc     <- calc_AICc(subsets$aic, n)
+    best_idx <- which.min(aicc)
+    
+    row[[paste0(resp, "_best_predictors")]] <- subsets$predictors[best_idx]
+    row[[paste0(resp, "_best_AICc")]]       <- round(aicc[best_idx], 3)
+    row[[paste0(resp, "_n_predictors")]]    <- best_idx
+  }
+  
+  part3_predictor_results[[label]] <- row
+}
+
+part3_predictor_table <- do.call(rbind, part3_predictor_results)
+rownames(part3_predictor_table) <- NULL
+
+# --- Print results by response variable ---
+cat("\n===== PART 3 PREDICTOR STABILITY CHECK =====\n")
+
+for (resp in c(accum_age_models, ablat_age_models)) {
+  
+  cat("\n---", resp, "---\n")
+  cols <- c("scenario", "n_sites",
+            paste0(resp, "_n_predictors"),
+            paste0(resp, "_best_AICc"),
+            paste0(resp, "_best_predictors"))
+  print(part3_predictor_table[, cols])
+  
+  # Flag changes from Age 50 baseline
+  pred_col <- paste0(resp, "_best_predictors")
+  ref      <- part3_predictor_table[[pred_col]][1]
+  changed  <- part3_predictor_table[[pred_col]] != ref
+  
+  if (any(changed)) {
+    cat("  *** Predictors changed from Age 50 baseline in:",
+        paste(part3_predictor_table$scenario[changed], collapse = ", "), "***\n")
+  } else {
+    cat("  Predictors stable across all scenarios\n")
+  }
+}
+```
+
+
+---
+
+## PART 3: Visualize sensitivity across scenarios
+
+```{r part3_sensitivity_plots, fig.width=14, fig.height=12}
+
+p3_age  <- part3_sensitivity_table %>% filter(scenario != "No controls") %>%
+           mutate(age_num = as.numeric(gsub("Age ", "", scenario)))
+p3_noct <- part3_sensitivity_table %>% filter(scenario == "No controls")
+
+# Generic plot function for Part 3
+make_part3_plot <- function(coef_col, pval_col, model_label, line_color = "steelblue") {
+  
+  noct_coef <- p3_noct[[coef_col]]
+  noct_pval <- p3_noct[[pval_col]]
+  
+  # Coefficient plot
+  pc <- ggplot(p3_age, aes(x = age_num, y = .data[[coef_col]])) +
+    geom_line(color = line_color, linewidth = 1) +
+    geom_point(size = 2.5, color = line_color) +
+    geom_vline(xintercept = 60, linetype = "dashed", color = "red", alpha = 0.6) +
+    geom_hline(yintercept = noct_coef, linetype = "dotdash", color = "darkgreen", linewidth = 0.9) +
+    geom_hline(yintercept = 0, linetype = "dashed", color = "gray60", alpha = 0.5) +
+    annotate("text", x = 52, y = noct_coef, label = "No controls",
+             color = "darkgreen", vjust = -0.5, size = 2.8) +
+    labs(title = paste(model_label, "- age coefficient"),
+         x = "Control Site Age", y = "Age Coefficient") +
+    theme_minimal(base_size = 10)
+  
+  # P-value plot
+  pp <- ggplot(p3_age, aes(x = age_num, y = .data[[pval_col]])) +
+    geom_line(color = line_color, linewidth = 1) +
+    geom_point(size = 2.5, color = line_color) +
+    geom_vline(xintercept = 60, linetype = "dashed", color = "red", alpha = 0.6) +
+    geom_hline(yintercept = noct_pval, linetype = "dotdash", color = "darkgreen", linewidth = 0.9) +
+    geom_hline(yintercept = 0.05, linetype = "dashed", color = "gray40") +
+    annotate("text", x = 52, y = noct_pval, label = "No controls",
+             color = "darkgreen", vjust = -0.5, size = 2.8) +
+    labs(title = paste(model_label, "- age p-value"),
+         x = "Control Site Age", y = "p-value (age)") +
+    theme_minimal(base_size = 10)
+  
+  list(coef = pc, pval = pp)
+}
+
+plots_accum2 <- make_part3_plot("accum2_age_coef", "accum2_age_pval", "accum2", "#2166ac")
+plots_accum4 <- make_part3_plot("accum4_age_coef", "accum4_age_pval", "accum4", "#4dac26")
+plots_accum5 <- make_part3_plot("accum5_age_coef", "accum5_age_pval", "accum5", "#d01c8b")
+plots_accum6 <- make_part3_plot("accum6_age_coef", "accum6_age_pval", "accum6", "#f1a340")
+plots_ablat1 <- make_part3_plot("ablat1_age_coef", "ablat1_age_pval", "ablat1", "#762a83")
+plots_ablat2 <- make_part3_plot("ablat2_age_coef", "ablat2_age_pval", "ablat2", "#1b7837")
+plots_ablat3 <- make_part3_plot("ablat3_age_coef", "ablat3_age_pval", "ablat3", "#b2182b")
+
+grid.arrange(
+  plots_accum2$coef, plots_accum2$pval,
+  plots_accum4$coef, plots_accum4$pval,
+  plots_accum5$coef, plots_accum5$pval,
+  plots_accum6$coef, plots_accum6$pval,
+  ncol = 2,
+  top = "Part 3 Sensitivity: Accumulation Models"
+)
+
+grid.arrange(
+  plots_ablat1$coef, plots_ablat1$pval,
+  plots_ablat2$coef, plots_ablat2$pval,
+  plots_ablat3$coef, plots_ablat3$pval,
+  ncol = 2,
+  top = "Part 3 Sensitivity: Ablation Models"
+)
+```
+
+---
+
+## Summary Table: Are the conclusions robust?
+
+This  includes the "No controls" scenario in the robustness check. A model is
+flagged as **Robust** only if the age effect is consistent in direction and
+significance level across ALL five scenarios (50, 60, 70, 80, and no controls).
+
+```{r sensitivity_summary_table}
+
+robustness_check <- function(pvals, coefs, model_name) {
+  sig_consistent  <- all(pvals < 0.05, na.rm = TRUE) || all(pvals >= 0.05, na.rm = TRUE)
+  sign_consistent <- all(coefs > 0, na.rm = TRUE)    || all(coefs < 0, na.rm = TRUE)
+  
+  status <- if (sig_consistent && sign_consistent) "Robust" else
+            if (!sign_consistent) "SENSITIVE - sign flip" else
+            "SENSITIVE - significance changes"
+  
+  data.frame(
+    Model        = model_name,
+    Min_age_pval = round(min(pvals, na.rm = TRUE), 5),
+    Max_age_pval = round(max(pvals, na.rm = TRUE), 5),
+    Min_age_coef = round(min(coefs, na.rm = TRUE), 5),
+    Max_age_coef = round(max(coefs, na.rm = TRUE), 5),
+    NoCtrl_pval  = round(pvals[length(pvals)], 5),   # last entry = "No controls"
+    NoCtrl_coef  = round(coefs[length(coefs)], 5),
+    Robustness   = status
+  )
+}
+
+robustness_table <- rbind(
+  robustness_check(part1_sensitivity_table$age_pval_ln_best,
+                   part1_sensitivity_table$age_coef_ln_best,  "ln(March SD) - Part 1"),
+  robustness_check(part1_sensitivity_table$age_pval_SDD_best,
+                   part1_sensitivity_table$age_coef_SDD_best, "SDD - Part 1"),
+  robustness_check(part3_sensitivity_table$accum2_age_pval,
+                   part3_sensitivity_table$accum2_age_coef,   "accum2 - Part 3"),
+  robustness_check(part3_sensitivity_table$accum4_age_pval,
+                   part3_sensitivity_table$accum4_age_coef,   "accum4 - Part 3"),
+  robustness_check(part3_sensitivity_table$accum5_age_pval,
+                   part3_sensitivity_table$accum5_age_coef,   "accum5 - Part 3"),
+  robustness_check(part3_sensitivity_table$accum6_age_pval,
+                   part3_sensitivity_table$accum6_age_coef,   "accum6 - Part 3"),
+  robustness_check(part3_sensitivity_table$ablat1_age_pval,
+                   part3_sensitivity_table$ablat1_age_coef,   "ablat1 - Part 3"),
+  robustness_check(part3_sensitivity_table$ablat2_age_pval,
+                   part3_sensitivity_table$ablat2_age_coef,   "ablat2 - Part 3"),
+  robustness_check(part3_sensitivity_table$ablat3_age_pval,
+                   part3_sensitivity_table$ablat3_age_coef,   "ablat3 - Part 3")
+)
+
+rownames(robustness_table) <- NULL
+cat("\n===== ROBUSTNESS SUMMARY =====\n")
+cat("(Includes age 50/60/70/80 AND no-control-sites scenario)\n\n")
+print(robustness_table)
+```
+
+---
+
+## Note on MARSS Models (Part 2)
+
+The MARSS models were not re-run in this sensitivity analysis because each run
+takes many hours, and there are 12 constrained models × 2 bin sizes × 4 age
+scenarios = 96 total runs (plus bootstrapping for the best model).
+
+s
