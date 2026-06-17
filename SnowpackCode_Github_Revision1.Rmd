@@ -34,6 +34,10 @@ library(boot)
 library(MARSS)
 library(caret)
 library(car)
+<<<<<<< HEAD
+=======
+library(readxl)
+>>>>>>> 007af31629a9e0b92c610b0e3b06b9ec9231e6a5
 library(lmtest)
 library(dotwhisker)
 library(dplyr)
@@ -2449,7 +2453,10 @@ for (ctrl_age in SENSITIVITY_AGES) {
   
   age_coef_ln   <- coef(ln_best)["age"]
   age_pval_ln   <- ln_best_summary$coefficients["age", "Pr(>|t|)"]
+<<<<<<< HEAD
   age_se_ln     <- ln_best_summary$coefficients["age", "Std. Error"]
+=======
+>>>>>>> 007af31629a9e0b92c610b0e3b06b9ec9231e6a5
   model_pval_ln <- pf(ln_best_summary$fstatistic[1],
                       ln_best_summary$fstatistic[2],
                       ln_best_summary$fstatistic[3],
@@ -2476,7 +2483,10 @@ for (ctrl_age in SENSITIVITY_AGES) {
   
   age_coef_SDD   <- coef(SDD_best)["age"]
   age_pval_SDD   <- SDD_best_summary$coefficients["age", "Pr(>|t|)"]
+<<<<<<< HEAD
   age_se_SDD     <- SDD_best_summary$coefficients["age", "Std. Error"]
+=======
+>>>>>>> 007af31629a9e0b92c610b0e3b06b9ec9231e6a5
   model_pval_SDD <- pf(SDD_best_summary$fstatistic[1],
                        SDD_best_summary$fstatistic[2],
                        SDD_best_summary$fstatistic[3],
@@ -2499,7 +2509,10 @@ for (ctrl_age in SENSITIVITY_AGES) {
     # ln_march_sd best model
     age_coef_ln_best   = round(age_coef_ln, 5),
     age_pval_ln_best   = round(age_pval_ln, 5),
+<<<<<<< HEAD
     age_se_ln_best     = round(age_se_ln, 5),
+=======
+>>>>>>> 007af31629a9e0b92c610b0e3b06b9ec9231e6a5
     model_pval_ln_best = round(model_pval_ln, 5),
     adjR2_ln_best      = round(adjr2_ln, 4),
     
@@ -2512,7 +2525,10 @@ for (ctrl_age in SENSITIVITY_AGES) {
     # SDD best model
     age_coef_SDD_best   = round(age_coef_SDD, 5),
     age_pval_SDD_best   = round(age_pval_SDD, 5),
+<<<<<<< HEAD
     age_se_SDD_best     = round(age_se_SDD, 5),
+=======
+>>>>>>> 007af31629a9e0b92c610b0e3b06b9ec9231e6a5
     model_pval_SDD_best = round(model_pval_SDD, 5),
     adjR2_SDD_best      = round(adjr2_SDD, 4)
   )
@@ -2523,6 +2539,7 @@ rownames(part1_sensitivity_table) <- NULL
 
 cat("\n\n===== PART 1 SENSITIVITY ANALYSIS RESULTS =====\n")
 print(part1_sensitivity_table)
+<<<<<<< HEAD
 
 
 library(modelsummary)
@@ -2603,6 +2620,10 @@ modelsummary(
 ```
 
 
+=======
+```
+
+>>>>>>> 007af31629a9e0b92c610b0e3b06b9ec9231e6a5
 ```{r check_subset_structure}
 # Run this FIRST to see exactly what column names ols_step_best_subset returns
 pd_test    <- process_raw_data(raw_data, 60)
